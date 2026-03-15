@@ -126,11 +126,13 @@ class HybridPipeline:
         if cfg.use_template_search:
             tmpl_result = self._run_template_search(target)
             if tmpl_result.used_template and tmpl_result.best_coords is not None:
-                print(f"  → template hit  TM={tmpl_result.hits[0].tm_score:.3f}")
+                best_hit = max(tmpl_result.hits, key=lambda h: h.tm_score)
+                print(f"  → template hit  {best_hit.pdb_id}  TM={best_hit.tm_score:.3f}")
                 candidates.append(tmpl_result.best_coords)
 
-        # --- Step 2: Deep learning models (for template-free targets) ---
-        if not candidates or not cfg.use_template_search:
+        # --- Step 2: Deep learning models ---
+        # Run when: no template was found, OR template search is disabled entirely.
+        if not candidates:
             if cfg.use_rhofold:
                 try:
                     dl_coords = self._run_rhofold(target)

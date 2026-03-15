@@ -7,9 +7,13 @@ Competition data fields:
   - temporal_cutoff: str (date)
   - description: str (optional)
 
-Labels (train only):
-  - target_id, residue_index, x_1..x_5, y_1..y_5, z_1..z_5
-    (C1' atom coordinates for 5 structures per residue)
+Labels (train only) — two schemas exist in this codebase:
+  - Kaggle raw labels CSV (used by src/training/train.py):
+      ID (= target_id + "_" + resid), resid (1-indexed int), resname,
+      x_1, y_1, z_1  (one structure per row)
+  - Submission / processed format (used by this loader):
+      target_id, residue_index (1-indexed int),
+      x_1..x_5, y_1..y_5, z_1..z_5  (5 structures, one row per residue)
 """
 
 from __future__ import annotations

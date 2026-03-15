@@ -41,7 +41,8 @@ def kabsch_rmsd_tmscore(P: torch.Tensor, Q: torch.Tensor) -> tuple[float, float]
     Q_c = Q - Q.mean(dim=0)
 
     H = P_c.T @ Q_c
-    U, S, V = torch.svd(H)
+    U, S, Vh = torch.linalg.svd(H)   # torch.svd is deprecated; linalg.svd returns Vh = V.T
+    V = Vh.mT
     d = torch.sign(torch.det(V @ U.T))
     D = torch.diag(torch.tensor([1.0, 1.0, d], device=P.device, dtype=P.dtype))
     R = V @ D @ U.T
@@ -329,17 +330,26 @@ def train(
                     loss_coord = F.smooth_l1_loss(pred[valid_mask], target_norm[valid_mask])
 
                     pred_d = pred * coord_std_t + coord_mean_t
-                    pv = pred_d.squeeze(0)[torch.isfinite(target.squeeze(0)).all(-1)]
-                    tv = target.squeeze(0)[torch.isfinite(target.squeeze(0)).all(-1)]
+                    valid_rows = torch.isfinite(target.squeeze(0)).all(-1)
+                    pv = pred_d.squeeze(0)[valid_rows]
+                    tv = target.squeeze(0)[valid_rows]
 
                     if len(pv) > 2:
                         loss_dist = F.smooth_l1_loss(
                             torch.cdist(pv.unsqueeze(0), pv.unsqueeze(0)).squeeze(0),
                             torch.cdist(tv.unsqueeze(0), tv.unsqueeze(0)).squeeze(0),
                         )
-                        pb = torch.sqrt(((pv[1:] - pv[:-1]) ** 2).sum(-1) + 1e-8)
-                        tb = torch.sqrt(((tv[1:] - tv[:-1]) ** 2).sum(-1) + 1e-8)
-                        loss_bond = F.smooth_l1_loss(pb, tb)
+                        # Bond loss: only between residues that are truly adjacent in
+                        # sequence (valid_rows may have gaps, so index-1 neighbours
+                        # are not always real C1'-C1' bonds).
+                        valid_idx = torch.where(valid_rows)[0]
+                        is_adj = (valid_idx[1:] - valid_idx[:-1]) == 1
+                        if is_adj.any():
+                            pb = torch.sqrt(((pv[1:][is_adj] - pv[:-1][is_adj]) ** 2).sum(-1) + 1e-8)
+                            tb = torch.sqrt(((tv[1:][is_adj] - tv[:-1][is_adj]) ** 2).sum(-1) + 1e-8)
+                            loss_bond = F.smooth_l1_loss(pb, tb)
+                        else:
+                            loss_bond = torch.tensor(0.0, device=device)
                     else:
                         loss_dist = loss_bond = torch.tensor(0.0, device=device)
 
