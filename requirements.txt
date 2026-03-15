@@ -1,0 +1,35 @@
+# Core
+numpy>=1.24
+pandas>=2.0
+pyyaml>=6.0
+biopython>=1.81          # CIF/PDB parsing (C1' extraction)
+
+# Deep learning
+torch>=2.1
+einops>=0.7
+
+# Boltz-1/2 (MIT license — AlphaFold3-level, supports RNA)
+# Install: pip install boltz
+boltz>=0.4
+
+# RhoFold+ — clone separately, not on PyPI
+# git clone https://github.com/ml4bio/RhoFold
+# pip install -r RhoFold/requirements.txt
+
+# RNAPro (RibonanzaNet2 + Protenix) — clone separately
+# git clone https://github.com/NVIDIA-Digital-Bio/RNAPro
+# pip install -r RNAPro/requirements.txt
+
+# Template search tools (system-level install, not pip)
+# - BLAST+:   https://ftp.ncbi.nlm.nih.gov/blast/executables/blast+/LATEST/
+# - Infernal: http://eddylab.org/infernal/
+# - US-align: https://zhanggroup.org/US-align/
+# - CD-HIT-EST: https://github.com/weizhongli/cdhit
+
+# Evaluation
+# TM-score / TM-align computed via subprocess (US-align binary)
+
+# Notebooks
+jupyter>=1.0
+matplotlib>=3.7
+seaborn>=0.12

@@ -1,0 +1,14 @@
+# RhoFold+ fine-tuning — Phase 1 (freeze encoder)
+model: rhofold
+rhofold_dir: /path/to/RhoFold
+pretrained_ckpt: /path/to/rhofold_pretrained.pt
+train_csv: data/train_sequences.csv
+labels_csv: data/train_labels.csv
+val_fraction: 0.1
+cluster_split: true
+phase: 1
+lr: 1.0e-4
+n_epochs: 15
+output_dir: checkpoints/rhofold_phase1
+device: cuda
+seed: 42
