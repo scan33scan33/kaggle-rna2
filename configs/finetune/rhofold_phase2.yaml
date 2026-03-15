@@ -1,0 +1,14 @@
+# RhoFold+ fine-tuning — Phase 2 (full model, lower LR)
+model: rhofold
+rhofold_dir: /path/to/RhoFold
+pretrained_ckpt: checkpoints/rhofold_phase1/best.pt  # start from phase 1
+train_csv: data/train_sequences.csv
+labels_csv: data/train_labels.csv
+val_fraction: 0.1
+cluster_split: true
+phase: 2
+lr: 5.0e-6
+n_epochs: 5
+output_dir: checkpoints/rhofold_phase2
+device: cuda
+seed: 42

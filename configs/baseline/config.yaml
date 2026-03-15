@@ -1,0 +1,33 @@
+# Baseline pipeline config
+# Adjust paths to match your local setup / Kaggle dataset mounts
+
+# --- Template search ---
+use_template_search: true
+pdb_dir: /kaggle/input/pdb-rna-chains         # PDB mmCIF files (RNA chains)
+blast_db: /kaggle/input/pdb-blast-db/pdb_rna  # BLAST nucleotide DB
+rfam_cm: /kaggle/input/rfam/Rfam.cm           # Rfam covariance model DB (optional)
+tm_threshold: 0.45                            # TM-score cutoff for "correct fold"
+
+# --- RhoFold+ ---
+use_rhofold: true
+rhofold_dir: /kaggle/input/rhofold-repo       # cloned ml4bio/RhoFold
+rhofold_checkpoint: /kaggle/input/rhofold-weights/rhofold_pretrained.pt
+
+# --- RibonanzaNet2 (via RNAPro) ---
+use_ribonanzanet2: false                      # enable after fine-tuning
+rnapro_dir: /kaggle/input/rnapro-repo
+ribonanzanet2_checkpoint: /kaggle/input/ribonanzanet2-weights/pytorch_model_fsdp.bin
+ribonanzanet2_head_checkpoint: ""             # set after fine-tuning
+
+# --- Boltz-1 ---
+use_boltz: false                              # enable as fallback if RhoFold not available
+boltz_model: boltz1                           # "boltz1" or "boltz2"
+boltz_cache_dir: /kaggle/input/boltz-weights
+
+# --- Ensemble ---
+ensemble_method: best_of_5   # "best_of_5" | "rank_weighted" | "average"
+n_structures: 5
+
+# --- Runtime ---
+device: cuda
+n_cpus: 4
