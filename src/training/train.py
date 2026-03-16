@@ -13,6 +13,7 @@ Inference:
 
 from __future__ import annotations
 
+import math
 import os
 
 import numpy as np
@@ -37,11 +38,21 @@ def kabsch_rmsd_tmscore(P: torch.Tensor, Q: torch.Tensor) -> tuple[float, float]
     if L == 0:
         return 0.0, 0.0
 
+    # Ensure float32 for numerical stability in SVD
+    P = P.float()
+    Q = Q.float()
+
+    if not (torch.isfinite(P).all() and torch.isfinite(Q).all()):
+        return float("inf"), 0.0
+
     P_c = P - P.mean(dim=0)
     Q_c = Q - Q.mean(dim=0)
 
     H = P_c.T @ Q_c
-    U, S, Vh = torch.linalg.svd(H)   # torch.svd is deprecated; linalg.svd returns Vh = V.T
+    try:
+        U, S, Vh = torch.linalg.svd(H)
+    except Exception:
+        return float("inf"), 0.0
     V = Vh.mT
     d = torch.sign(torch.det(V @ U.T))
     D = torch.diag(torch.tensor([1.0, 1.0, d], device=P.device, dtype=P.dtype))
@@ -49,6 +60,9 @@ def kabsch_rmsd_tmscore(P: torch.Tensor, Q: torch.Tensor) -> tuple[float, float]
 
     P_aligned = (P_c @ R.T) + Q.mean(dim=0)
     dist_sq = ((P_aligned - Q) ** 2).sum(dim=1)
+
+    if not torch.isfinite(dist_sq).all():
+        return float("inf"), 0.0
 
     rmsd = dist_sq.mean().sqrt().item()
 
@@ -129,19 +143,71 @@ class TemplateMatcher:
 # RibonanzaNet2 feature extractor
 # ---------------------------------------------------------------------------
 
+def _download_ribonanzanet2(dest_dir: str) -> bool:
+    """Download RibonanzaNet2 checkpoint from Kaggle if not present."""
+    import subprocess, tarfile, tempfile
+    if os.path.exists(dest_dir) and any(
+        f.endswith((".pt", ".bin")) for f in os.listdir(dest_dir)
+    ):
+        return True
+    # Try kagglehub first
+    try:
+        import kagglehub  # type: ignore
+        path = kagglehub.model_download("shujun717/ribonanzanet2/PyTorch/alpha/1")
+        if path and os.path.exists(path):
+            print(f"RibonanzaNet2 downloaded via kagglehub → {path}")
+            return True
+    except Exception:
+        pass
+    # Fallback: curl download
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        url = "https://www.kaggle.com/api/v1/models/shujun717/ribonanzanet2/pyTorch/alpha/1/download"
+        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+            tmp_path = tmp.name
+        print(f"Downloading RibonanzaNet2 from Kaggle...")
+        subprocess.run(["curl", "-L", "-o", tmp_path, url], check=True, capture_output=True)
+        with tarfile.open(tmp_path, "r:gz") as tar:
+            tar.extractall(dest_dir)
+        os.unlink(tmp_path)
+        print(f"RibonanzaNet2 extracted → {dest_dir}")
+        return True
+    except Exception as e:
+        print(f"RibonanzaNet2 download failed: {e}")
+        return False
+
+
 class RibonanzaFeatureExtractor:
     """
     Loads RibonanzaNet2 from its Kaggle model checkpoint and extracts
     (1D, 2D) representations for RNA sequences.
     Falls back gracefully if weights are unavailable.
+
+    Uses forward hooks on the encoder layers to capture the last hidden
+    states, so we get useful features even when the model's full forward
+    fails (e.g. due to internal None pairwise features).
     """
 
-    def __init__(self, checkpoint_path: str = ""):
+    def __init__(self, checkpoint_path: str = "", auto_download: bool = True):
         self.available = False
         self.model = None
+        self._ninp = 256          # sequence feature dim (updated after load)
+        self._pairwise_dim = 64   # pairwise feature dim (updated after load)
+        self._hooked_1d: list[torch.Tensor] = []
+        self._hooked_2d: list[torch.Tensor] = []
+        self._hooks: list = []
+        self._forward_error_printed = False
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        if not checkpoint_path or not os.path.exists(checkpoint_path):
+        if not checkpoint_path:
+            print("RibonanzaNet2: no checkpoint path provided. Skipping.")
+            return
+
+        # Auto-download if not present
+        if not os.path.exists(checkpoint_path) and auto_download:
+            _download_ribonanzanet2(checkpoint_path)
+
+        if not os.path.exists(checkpoint_path):
             print(f"RibonanzaNet2 not found at '{checkpoint_path}'. Skipping.")
             return
 
@@ -161,19 +227,50 @@ class RibonanzaFeatureExtractor:
                 return
 
             config = self._load_config(checkpoint_path, weight_files[0])
+            self._ninp = getattr(config, "ninp", 256)
+            self._pairwise_dim = getattr(config, "pairwise_dimension", 64)
+
             self.model = RibonanzaNet(config).to(self.device)
             state = torch.load(weight_files[0], map_location=self.device)
             state = state.get("state_dict", state.get("model_state_dict", state))
             self.model.load_state_dict(state, strict=False)
             self.model.eval()
+
+            # Register hooks on encoder layers to capture hidden states.
+            # This lets us get features even if the full forward() raises.
+            self._register_encoder_hooks()
+
             self.available = True
             print("RibonanzaNet2 loaded successfully.")
         except Exception as e:
             print(f"RibonanzaNet2 init failed: {e}")
 
+    def _register_encoder_hooks(self):
+        """Hook every ConvTransformerEncoderLayer to capture last 1D output."""
+        if self.model is None:
+            return
+        for name, module in self.model.named_modules():
+            cls = type(module).__name__
+            if "ConvTransformerEncoderLayer" in cls or "EncoderLayer" in cls:
+                handle = module.register_forward_hook(self._hook_fn_1d)
+                self._hooks.append(handle)
+
+    def _hook_fn_1d(self, module, inp, output):
+        """Capture the sequence (1D) output from each encoder layer."""
+        # Output can be a tensor (B,L,D) or a tuple (tensor, pairwise, ...)
+        feat = output[0] if isinstance(output, tuple) else output
+        if isinstance(feat, torch.Tensor) and feat.dim() == 3:
+            self._hooked_1d.append(feat.detach().float())
+        # If pairwise is returned as second element, capture it too
+        if isinstance(output, tuple) and len(output) >= 2:
+            pairwise = output[1]
+            if isinstance(pairwise, torch.Tensor) and pairwise.dim() == 4:
+                self._hooked_2d.append(pairwise.detach().float())
+
     def _load_config(self, checkpoint_path: str, weight_file: str):
         import yaml, json  # noqa: F811
-        for cfg_name in ["config.yaml", "config.yml", "config.json"]:
+        # Search for config files — RibonanzaNet2 ships pairwise.yaml
+        for cfg_name in ["pairwise.yaml", "config.yaml", "config.yml", "config.json"]:
             p = os.path.join(checkpoint_path, cfg_name)
             if os.path.exists(p):
                 with open(p) as f:
@@ -190,10 +287,12 @@ class RibonanzaFeatureExtractor:
             for k, v in raw.items():
                 setattr(cfg, k, v)
             return cfg
-        # Default fallback
+        # Default fallback — matches RibonanzaNet2 pairwise.yaml defaults
         return type("Cfg", (), {
-            "ninp": 384, "nhid": 384, "nhead": 12, "nlayers": 12,
-            "dropout": 0.1, "k": 5, "ntoken": 6, "dim": 384, "pair_dim": 128,
+            "ninp": 256, "nhead": 8, "nlayers": 9, "ntoken": 5,
+            "nclass": 2, "pairwise_dimension": 64,
+            "use_triangular_attention": False,
+            "dropout": 0.05, "k": 5,
         })()
 
     def forward(
@@ -201,6 +300,7 @@ class RibonanzaFeatureExtractor:
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if not self.available or self.model is None:
             return None, None
+        # RibonanzaNet2 uses 1-indexed tokens: A=1,C=2,G=3,U=4; 0=padding
         mapping = {"A": 1, "C": 2, "G": 3, "U": 4}
         B = len(sequences)
         L = max(len(s) for s in sequences)
@@ -208,16 +308,44 @@ class RibonanzaFeatureExtractor:
         for i, s in enumerate(sequences):
             for j, c in enumerate(s):
                 tokens[i, j] = mapping.get(c.upper(), 0)
+
+        self._hooked_1d.clear()
+        self._hooked_2d.clear()
+
         try:
             with torch.no_grad():
                 out = self.model(tokens)
+            # Success path: model returned normally
+            # Prefer direct tuple output (seq_feats, pairwise_feats)
             if isinstance(out, tuple) and len(out) >= 2:
-                return out[0], out[1]
+                feat_1d, feat_2d = out[0], out[1]
+                if isinstance(feat_1d, torch.Tensor) and feat_1d.dim() == 3:
+                    feat_2d_out = feat_2d if (
+                        isinstance(feat_2d, torch.Tensor) and feat_2d.dim() == 4
+                    ) else None
+                    return feat_1d.float(), feat_2d_out
             if isinstance(out, torch.Tensor) and out.dim() == 3:
-                return out, torch.zeros(B, L, L, 32, device=self.device)
+                # Single tensor output — use as 1D features
+                return out.float(), None
         except Exception as e:
-            print(f"RibonanzaNet2 forward failed: {e}")
-            self.available = False
+            # Print full traceback once so the user can see what's happening
+            if not self._forward_error_printed:
+                import traceback
+                print(f"RibonanzaNet2 forward failed: {e}")
+                traceback.print_exc()
+                self._forward_error_printed = True
+
+        # Hook fallback: use the last successfully captured encoder layer output
+        if self._hooked_1d:
+            feat_1d = self._hooked_1d[-1]   # last encoder layer output
+            feat_2d = self._hooked_2d[-1] if self._hooked_2d else None
+            if not self._forward_error_printed:
+                # Only printed once, so suppress subsequent noise
+                pass
+            return feat_1d, feat_2d
+
+        # Complete failure: disable to avoid per-sample error spam
+        self.available = False
         return None, None
 
 
@@ -242,7 +370,10 @@ def _build_coords_array(group: pd.DataFrame, seq_len: int) -> np.ndarray | None:
 
 def _autocast_ctx():
     if torch.cuda.is_available():
-        return torch.autocast("cuda", dtype=torch.float16)
+        # bfloat16 has float32 dynamic range — prevents overflow in outer product layers
+        # float16 max is 65504, which overflows easily in pairwise (L×L×1024) ops
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        return torch.autocast("cuda", dtype=dtype)
     import contextlib
     return contextlib.nullcontext()
 
@@ -312,7 +443,7 @@ def train(
                 continue
 
             seq_idx = torch.tensor([tokenise(seq_str)], device=device)
-            target  = torch.tensor([coords], dtype=torch.float32, device=device)
+            target  = torch.from_numpy(coords).unsqueeze(0).to(device=device)
 
             ribo_1d, ribo_2d = (extractor.forward([seq_str]) if extractor else (None, None))
 
@@ -440,7 +571,7 @@ def evaluate(
                 skipped += 1; continue
 
             seq_idx = torch.tensor([tokenise(seq_str)], device=device)
-            target  = torch.tensor([coords], dtype=torch.float32, device=device)
+            target  = torch.from_numpy(coords).unsqueeze(0).to(device=device)
             ribo_1d, ribo_2d = (extractor.forward([seq_str]) if extractor else (None, None))
 
             pred = model(seq_idx, ribo_1d_feats=ribo_1d, ribo_2d_feats=ribo_2d)
@@ -459,11 +590,14 @@ def evaluate(
 
             row_valid = torch.isfinite(target.squeeze(0)).all(-1)
             if row_valid.any():
-                pv = (pred * coord_std_t + coord_mean_t).squeeze(0)[row_valid]
+                # Clamp to training distribution before denorm to avoid float overflow
+                pred_clamped = pred.float().clamp(-15, 15)
+                pv = (pred_clamped * coord_std_t + coord_mean_t).squeeze(0)[row_valid]
                 tv = target.squeeze(0)[row_valid]
                 rmsd, tm = kabsch_rmsd_tmscore(pv, tv)
-                total_rmsd += rmsd
-                total_tm   += tm
+                if math.isfinite(rmsd) and rmsd < 1e5:
+                    total_rmsd += rmsd
+                    total_tm   += tm
                 total_pts  += row_valid.sum().item()
             count += 1
 
@@ -475,6 +609,34 @@ def evaluate(
         "count":        count,
         "skipped":      skipped,
     }
+
+
+def train_val_split(
+    seq_df: pd.DataFrame,
+    labels_df: pd.DataFrame,
+    val_fraction: float = 0.15,
+    seed: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Split seq_df/labels_df into train and val portions.
+    Returns (train_seq, train_labels, val_seq, val_labels).
+    """
+    rng = np.random.default_rng(seed)
+    ids = seq_df["target_id"].unique()
+    n_val = max(1, int(len(ids) * val_fraction))
+    val_ids = set(rng.choice(ids, size=n_val, replace=False).tolist())
+
+    train_seq    = seq_df[~seq_df["target_id"].isin(val_ids)].reset_index(drop=True)
+    val_seq      = seq_df[ seq_df["target_id"].isin(val_ids)].reset_index(drop=True)
+
+    # Propagate target_id column to labels if needed
+    lbl = labels_df.copy()
+    if "target_id" not in lbl.columns:
+        lbl["target_id"] = lbl["ID"].str.rsplit("_", n=1).str[0]
+    train_labels = lbl[~lbl["target_id"].isin(val_ids)].reset_index(drop=True)
+    val_labels   = lbl[ lbl["target_id"].isin(val_ids)].reset_index(drop=True)
+
+    return train_seq, train_labels, val_seq, val_labels
 
 
 # ---------------------------------------------------------------------------

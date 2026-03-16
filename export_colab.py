@@ -171,7 +171,18 @@ if __name__ == "__main__" or True:   # `or True` so Colab runs it on execute
         if val_seq_df is not None:
             val_seq_df = val_seq_df.head(20)
 
-    print(f"Train: {len(train_seq_df)} seqs | Val: {len(val_seq_df) if val_seq_df is not None else 0} seqs")
+    # ── Create train-subset val split if no labelled val set exists ───────
+    # This is used as a sanity check that the model can actually learn.
+    # Split 15% of training data off as a proxy validation set.
+    tr_seq_split, tr_lbl_split, proxy_val_seq, proxy_val_lbl = train_val_split(
+        train_seq_df, train_labels_df, val_fraction=0.15,
+    )
+    have_real_val = val_seq_df is not None and val_labels_df is not None
+    print(
+        f"Train: {len(train_seq_df)} seqs | "
+        f"Val: {len(val_seq_df) if have_real_val else 0} seqs (competition) | "
+        f"Proxy val: {len(proxy_val_seq)} seqs (from training split)"
+    )
 
     # ── Model + extractors ────────────────────────────────────────────────
     model     = AlphaFold3InspiredRNA().to(DEVICE)
@@ -190,15 +201,53 @@ if __name__ == "__main__" or True:   # `or True` so Colab runs it on execute
             1e-6, None,
         )
     else:
+        # Train with the proxy val split so we can always see learning progress
         coord_mean, coord_std = train(
-            model, train_seq_df, train_labels_df,
-            val_seq_df=val_seq_df, val_labels_df=val_labels_df,
+            model, tr_seq_split, tr_lbl_split,
+            val_seq_df=proxy_val_seq, val_labels_df=proxy_val_lbl,
             extractor=extractor,
             epochs=N_EPOCHS, lr=1e-4, max_seq_len=MAX_SEQ_LEN,
             device=DEVICE,
         )
         torch.save(model.state_dict(), WEIGHTS_PATH)
         print(f"Saved weights → {WEIGHTS_PATH}")
+
+    # ── Overfit sanity check: eval on a few TRAINING samples ─────────────
+    # If TM-score here is < 0.1 the model is not learning at all.
+    coord_mean_t = torch.tensor(coord_mean, dtype=torch.float32, device=DEVICE).view(1,1,3)
+    coord_std_t  = torch.tensor(coord_std,  dtype=torch.float32, device=DEVICE).view(1,1,3)
+    if "target_id" not in tr_lbl_split.columns:
+        tr_lbl_split["target_id"] = tr_lbl_split["ID"].str.rsplit("_", n=1).str[0]
+    train_lbl_grouped = tr_lbl_split.groupby("target_id")
+    overfit = evaluate(
+        model, tr_seq_split.head(20), train_lbl_grouped,
+        coord_mean_t, coord_std_t, extractor=extractor,
+        max_seq_len=MAX_SEQ_LEN, device=DEVICE,
+    )
+    print(
+        f"\n── Overfit check (train subset) ──────────────────────────────\n"
+        f"  TM-score={overfit['tm_score']:.4f} | RMSD={overfit['kabsch_rmsd']:.2f} Å | "
+        f"loss={overfit['avg_loss']:.4f} | n={overfit['count']}\n"
+        f"  (TM>0.1 confirms model is learning; TM~0 means it is not)\n"
+        f"──────────────────────────────────────────────────────────────"
+    )
+
+    # ── Competition val evaluation (if labels available) ─────────────────
+    if have_real_val:
+        if "target_id" not in val_labels_df.columns:
+            val_labels_df["target_id"] = val_labels_df["ID"].str.rsplit("_", n=1).str[0]
+        val_lbl_grouped = val_labels_df.groupby("target_id")
+        val_metrics = evaluate(
+            model, val_seq_df, val_lbl_grouped,
+            coord_mean_t, coord_std_t, extractor=extractor,
+            max_seq_len=MAX_SEQ_LEN, device=DEVICE,
+        )
+        print(
+            f"── Competition val ───────────────────────────────────────────\n"
+            f"  TM-score={val_metrics['tm_score']:.4f} | RMSD={val_metrics['kabsch_rmsd']:.2f} Å | "
+            f"n={val_metrics['count']}\n"
+            f"──────────────────────────────────────────────────────────────"
+        )
 
     # ── Inference + submission ─────────────────────────────────────────────
     submission_rows = run_inference(
