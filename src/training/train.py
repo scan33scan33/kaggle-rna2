@@ -368,8 +368,8 @@ def _build_coords_array(group: pd.DataFrame, seq_len: int) -> np.ndarray | None:
     valid = np.where(~np.isnan(coords[:, 0]))[0]
     if len(valid) == 0:
         return None
-    # Zero-centre at first valid residue
-    coords -= coords[valid[0]]
+    # Zero-centre at centroid of valid residues (more balanced than first residue)
+    coords -= coords[valid].mean(axis=0)
     return coords
 
 
@@ -489,7 +489,7 @@ def train(
                     else:
                         loss_dist = loss_bond = torch.tensor(0.0, device=device)
 
-                    loss = loss_coord + 0.02 * loss_dist + 0.05 * loss_bond
+                    loss = loss_coord + 0.2 * loss_dist + 0.1 * loss_bond
 
                 if not torch.isfinite(loss):
                     skipped += 1; continue

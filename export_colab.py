@@ -140,7 +140,10 @@ if __name__ == "__main__" or True:   # `or True` so Colab runs it on execute
 
     # ── Config ────────────────────────────────────────────────────────────
     PILOT_MODE    = True      # set False for full competition run
-    N_EPOCHS      = 5 if PILOT_MODE else 50
+    N_EPOCHS      = 20 if PILOT_MODE else 50
+    # Fewer accumulation steps in pilot mode → more optimizer updates per epoch
+    # (pilot has ~72 seqs; 16 steps → only 4 updates/epoch; 4 steps → 18 updates/epoch)
+    ACCUM_STEPS   = 4 if PILOT_MODE else 16
     MAX_SEQ_LEN   = 2000
     WEIGHTS_PATH  = "model_weights.pt"
     LOAD_IF_EXISTS = False     # set True to skip training and reuse saved weights
@@ -208,6 +211,7 @@ if __name__ == "__main__" or True:   # `or True` so Colab runs it on execute
             val_seq_df=proxy_val_seq, val_labels_df=proxy_val_lbl,
             extractor=extractor,
             epochs=N_EPOCHS, lr=1e-4, max_seq_len=MAX_SEQ_LEN,
+            accumulation_steps=ACCUM_STEPS,
             device=DEVICE,
         )
         torch.save(model.state_dict(), WEIGHTS_PATH)

@@ -1557,8 +1557,8 @@ def _build_coords_array(group: pd.DataFrame, seq_len: int) -> np.ndarray | None:
     valid = np.where(~np.isnan(coords[:, 0]))[0]
     if len(valid) == 0:
         return None
-    # Zero-centre at first valid residue
-    coords -= coords[valid[0]]
+    # Zero-centre at centroid of valid residues (more balanced than first residue)
+    coords -= coords[valid].mean(axis=0)
     return coords
 
 
@@ -1678,7 +1678,7 @@ def train(
                     else:
                         loss_dist = loss_bond = torch.tensor(0.0, device=device)
 
-                    loss = loss_coord + 0.02 * loss_dist + 0.05 * loss_bond
+                    loss = loss_coord + 0.2 * loss_dist + 0.1 * loss_bond
 
                 if not torch.isfinite(loss):
                     skipped += 1; continue
@@ -2311,7 +2311,10 @@ if __name__ == "__main__" or True:   # `or True` so Colab runs it on execute
 
     # ── Config ────────────────────────────────────────────────────────────
     PILOT_MODE    = True      # set False for full competition run
-    N_EPOCHS      = 5 if PILOT_MODE else 50
+    N_EPOCHS      = 20 if PILOT_MODE else 50
+    # Fewer accumulation steps in pilot mode → more optimizer updates per epoch
+    # (pilot has ~72 seqs; 16 steps → only 4 updates/epoch; 4 steps → 18 updates/epoch)
+    ACCUM_STEPS   = 4 if PILOT_MODE else 16
     MAX_SEQ_LEN   = 2000
     WEIGHTS_PATH  = "model_weights.pt"
     LOAD_IF_EXISTS = False     # set True to skip training and reuse saved weights
@@ -2379,6 +2382,7 @@ if __name__ == "__main__" or True:   # `or True` so Colab runs it on execute
             val_seq_df=proxy_val_seq, val_labels_df=proxy_val_lbl,
             extractor=extractor,
             epochs=N_EPOCHS, lr=1e-4, max_seq_len=MAX_SEQ_LEN,
+            accumulation_steps=ACCUM_STEPS,
             device=DEVICE,
         )
         torch.save(model.state_dict(), WEIGHTS_PATH)
