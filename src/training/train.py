@@ -37,11 +37,21 @@ def kabsch_rmsd_tmscore(P: torch.Tensor, Q: torch.Tensor) -> tuple[float, float]
     if L == 0:
         return 0.0, 0.0
 
+    # Ensure float32 for numerical stability in SVD
+    P = P.float()
+    Q = Q.float()
+
+    if not (torch.isfinite(P).all() and torch.isfinite(Q).all()):
+        return float("inf"), 0.0
+
     P_c = P - P.mean(dim=0)
     Q_c = Q - Q.mean(dim=0)
 
     H = P_c.T @ Q_c
-    U, S, Vh = torch.linalg.svd(H)   # torch.svd is deprecated; linalg.svd returns Vh = V.T
+    try:
+        U, S, Vh = torch.linalg.svd(H)
+    except Exception:
+        return float("inf"), 0.0
     V = Vh.mT
     d = torch.sign(torch.det(V @ U.T))
     D = torch.diag(torch.tensor([1.0, 1.0, d], device=P.device, dtype=P.dtype))
@@ -49,6 +59,9 @@ def kabsch_rmsd_tmscore(P: torch.Tensor, Q: torch.Tensor) -> tuple[float, float]
 
     P_aligned = (P_c @ R.T) + Q.mean(dim=0)
     dist_sq = ((P_aligned - Q) ** 2).sum(dim=1)
+
+    if not torch.isfinite(dist_sq).all():
+        return float("inf"), 0.0
 
     rmsd = dist_sq.mean().sqrt().item()
 
@@ -129,6 +142,40 @@ class TemplateMatcher:
 # RibonanzaNet2 feature extractor
 # ---------------------------------------------------------------------------
 
+def _download_ribonanzanet2(dest_dir: str) -> bool:
+    """Download RibonanzaNet2 checkpoint from Kaggle if not present."""
+    import subprocess, tarfile, tempfile
+    if os.path.exists(dest_dir) and any(
+        f.endswith((".pt", ".bin")) for f in os.listdir(dest_dir)
+    ):
+        return True
+    # Try kagglehub first
+    try:
+        import kagglehub  # type: ignore
+        path = kagglehub.model_download("shujun717/ribonanzanet2/PyTorch/alpha/1")
+        if path and os.path.exists(path):
+            print(f"RibonanzaNet2 downloaded via kagglehub → {path}")
+            return True
+    except Exception:
+        pass
+    # Fallback: curl download
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        url = "https://www.kaggle.com/api/v1/models/shujun717/ribonanzanet2/pyTorch/alpha/1/download"
+        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+            tmp_path = tmp.name
+        print(f"Downloading RibonanzaNet2 from Kaggle...")
+        subprocess.run(["curl", "-L", "-o", tmp_path, url], check=True, capture_output=True)
+        with tarfile.open(tmp_path, "r:gz") as tar:
+            tar.extractall(dest_dir)
+        os.unlink(tmp_path)
+        print(f"RibonanzaNet2 extracted → {dest_dir}")
+        return True
+    except Exception as e:
+        print(f"RibonanzaNet2 download failed: {e}")
+        return False
+
+
 class RibonanzaFeatureExtractor:
     """
     Loads RibonanzaNet2 from its Kaggle model checkpoint and extracts
@@ -136,12 +183,20 @@ class RibonanzaFeatureExtractor:
     Falls back gracefully if weights are unavailable.
     """
 
-    def __init__(self, checkpoint_path: str = ""):
+    def __init__(self, checkpoint_path: str = "", auto_download: bool = True):
         self.available = False
         self.model = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        if not checkpoint_path or not os.path.exists(checkpoint_path):
+        if not checkpoint_path:
+            print("RibonanzaNet2: no checkpoint path provided. Skipping.")
+            return
+
+        # Auto-download if not present
+        if not os.path.exists(checkpoint_path) and auto_download:
+            _download_ribonanzanet2(checkpoint_path)
+
+        if not os.path.exists(checkpoint_path):
             print(f"RibonanzaNet2 not found at '{checkpoint_path}'. Skipping.")
             return
 
@@ -173,7 +228,8 @@ class RibonanzaFeatureExtractor:
 
     def _load_config(self, checkpoint_path: str, weight_file: str):
         import yaml, json  # noqa: F811
-        for cfg_name in ["config.yaml", "config.yml", "config.json"]:
+        # Search for config files — RibonanzaNet2 ships pairwise.yaml
+        for cfg_name in ["pairwise.yaml", "config.yaml", "config.yml", "config.json"]:
             p = os.path.join(checkpoint_path, cfg_name)
             if os.path.exists(p):
                 with open(p) as f:
@@ -190,10 +246,12 @@ class RibonanzaFeatureExtractor:
             for k, v in raw.items():
                 setattr(cfg, k, v)
             return cfg
-        # Default fallback
+        # Default fallback — matches RibonanzaNet2 pairwise.yaml defaults
         return type("Cfg", (), {
-            "ninp": 384, "nhid": 384, "nhead": 12, "nlayers": 12,
-            "dropout": 0.1, "k": 5, "ntoken": 6, "dim": 384, "pair_dim": 128,
+            "ninp": 256, "nhead": 8, "nlayers": 9, "ntoken": 5,
+            "nclass": 2, "pairwise_dimension": 64,
+            "use_triangular_attention": False,
+            "dropout": 0.05, "k": 5,
         })()
 
     def forward(
@@ -312,7 +370,7 @@ def train(
                 continue
 
             seq_idx = torch.tensor([tokenise(seq_str)], device=device)
-            target  = torch.tensor([coords], dtype=torch.float32, device=device)
+            target  = torch.from_numpy(coords).unsqueeze(0).to(device=device)
 
             ribo_1d, ribo_2d = (extractor.forward([seq_str]) if extractor else (None, None))
 
@@ -440,7 +498,7 @@ def evaluate(
                 skipped += 1; continue
 
             seq_idx = torch.tensor([tokenise(seq_str)], device=device)
-            target  = torch.tensor([coords], dtype=torch.float32, device=device)
+            target  = torch.from_numpy(coords).unsqueeze(0).to(device=device)
             ribo_1d, ribo_2d = (extractor.forward([seq_str]) if extractor else (None, None))
 
             pred = model(seq_idx, ribo_1d_feats=ribo_1d, ribo_2d_feats=ribo_2d)
@@ -462,8 +520,9 @@ def evaluate(
                 pv = (pred * coord_std_t + coord_mean_t).squeeze(0)[row_valid]
                 tv = target.squeeze(0)[row_valid]
                 rmsd, tm = kabsch_rmsd_tmscore(pv, tv)
-                total_rmsd += rmsd
-                total_tm   += tm
+                if rmsd != float("inf"):
+                    total_rmsd += rmsd
+                    total_tm   += tm
                 total_pts  += row_valid.sum().item()
             count += 1
 
