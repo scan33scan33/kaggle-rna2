@@ -1514,13 +1514,20 @@ class RibonanzaFeatureExtractor:
             if isinstance(out, tuple) and len(out) >= 2:
                 feat_1d, feat_2d = out[0], out[1]
                 if isinstance(feat_1d, torch.Tensor) and feat_1d.dim() == 3:
-                    feat_2d_out = feat_2d if (
-                        isinstance(feat_2d, torch.Tensor) and feat_2d.dim() == 4
-                    ) else None
-                    return feat_1d.float(), feat_2d_out
+                    if feat_1d.shape[-1] != self._ninp:
+                        # Wrong feature dim (e.g. logit output rather than hidden state);
+                        # fall through to hook fallback below
+                        feat_1d = None
+                    else:
+                        feat_2d_out = feat_2d if (
+                            isinstance(feat_2d, torch.Tensor) and feat_2d.dim() == 4
+                            and feat_2d.shape[-1] == self._pairwise_dim
+                        ) else None
+                        return feat_1d.float(), feat_2d_out
             if isinstance(out, torch.Tensor) and out.dim() == 3:
-                # Single tensor output — use as 1D features
-                return out.float(), None
+                if out.shape[-1] == self._ninp:
+                    return out.float(), None
+                # Wrong dim — fall through to hook fallback
         except Exception as e:
             # Print full traceback once so the user can see what's happening
             if not self._forward_error_printed:
@@ -1530,13 +1537,15 @@ class RibonanzaFeatureExtractor:
                 self._forward_error_printed = True
 
         # Hook fallback: use the last successfully captured encoder layer output
-        if self._hooked_1d:
-            feat_1d = self._hooked_1d[-1]   # last encoder layer output
-            feat_2d = self._hooked_2d[-1] if self._hooked_2d else None
-            if not self._forward_error_printed:
-                # Only printed once, so suppress subsequent noise
-                pass
-            return feat_1d, feat_2d
+        # whose hidden dim matches _ninp
+        for feat_1d in reversed(self._hooked_1d):
+            if feat_1d.shape[-1] == self._ninp:
+                feat_2d = None
+                for f2 in reversed(self._hooked_2d):
+                    if f2.shape[-1] == self._pairwise_dim:
+                        feat_2d = f2
+                        break
+                return feat_1d, feat_2d
 
         # Complete failure: disable to avoid per-sample error spam
         self.available = False
