@@ -119,8 +119,6 @@ class AlphaFold3InspiredRNA(nn.Module):
         num_blocks: int = 8,
         max_len: int = 4096,
         dropout: float = 0.1,
-        ribo_1d_dim: int = 256,   # RibonanzaNet2 encoder hidden dim (ninp)
-        ribo_2d_dim: int = 64,    # RibonanzaNet2 pairwise dim
     ):
         super().__init__()
         self.d_single = d_single
@@ -130,9 +128,10 @@ class AlphaFold3InspiredRNA(nn.Module):
         self.abs_pos_emb = nn.Embedding(max_len, d_single)
         self.rel_pos_emb = nn.Embedding(65, d_pair)       # [-32, +32] clipped
 
-        # RibonanzaNet2 integration projections — dims match actual checkpoint output
-        self.ribo_proj_1d = nn.Linear(ribo_1d_dim, d_single)
-        self.ribo_proj_2d = nn.Linear(ribo_2d_dim, d_pair)
+        # RibonanzaNet2 integration projections — LazyLinear infers input dim on
+        # first forward so we don't need to hard-code the checkpoint's hidden size.
+        self.ribo_proj_1d = nn.LazyLinear(d_single)
+        self.ribo_proj_2d = nn.LazyLinear(d_pair)
 
         self.blocks = nn.ModuleList([
             PairformerBlock(d_single, d_pair, nhead, dropout)

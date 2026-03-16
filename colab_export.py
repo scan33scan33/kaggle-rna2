@@ -148,8 +148,6 @@ class AlphaFold3InspiredRNA(nn.Module):
         num_blocks: int = 8,
         max_len: int = 4096,
         dropout: float = 0.1,
-        ribo_1d_dim: int = 256,   # RibonanzaNet2 encoder hidden dim (ninp)
-        ribo_2d_dim: int = 64,    # RibonanzaNet2 pairwise dim
     ):
         super().__init__()
         self.d_single = d_single
@@ -159,9 +157,10 @@ class AlphaFold3InspiredRNA(nn.Module):
         self.abs_pos_emb = nn.Embedding(max_len, d_single)
         self.rel_pos_emb = nn.Embedding(65, d_pair)       # [-32, +32] clipped
 
-        # RibonanzaNet2 integration projections — dims match actual checkpoint output
-        self.ribo_proj_1d = nn.Linear(ribo_1d_dim, d_single)
-        self.ribo_proj_2d = nn.Linear(ribo_2d_dim, d_pair)
+        # RibonanzaNet2 integration projections — LazyLinear infers input dim on
+        # first forward so we don't need to hard-code the checkpoint's hidden size.
+        self.ribo_proj_1d = nn.LazyLinear(d_single)
+        self.ribo_proj_2d = nn.LazyLinear(d_pair)
 
         self.blocks = nn.ModuleList([
             PairformerBlock(d_single, d_pair, nhead, dropout)
@@ -1501,9 +1500,14 @@ class RibonanzaFeatureExtractor:
         self._hooked_1d.clear()
         self._hooked_2d.clear()
 
+        # src_mask: (B, L) float, 1.0 = valid position, 0.0 = padding.
+        # TriangleMultiplicativeModule always calls src_mask.unsqueeze(-1),
+        # so passing None causes AttributeError. Use all-ones (no padding).
+        src_mask = (tokens > 0).float()
+
         try:
             with torch.no_grad():
-                out = self.model(tokens)
+                out = self.model(tokens, src_mask=src_mask)
             # Success path: model returned normally
             # Prefer direct tuple output (seq_feats, pairwise_feats)
             if isinstance(out, tuple) and len(out) >= 2:
@@ -1552,8 +1556,8 @@ def _build_coords_array(group: pd.DataFrame, seq_len: int) -> np.ndarray | None:
     valid = np.where(~np.isnan(coords[:, 0]))[0]
     if len(valid) == 0:
         return None
-    # Zero-centre at first valid residue
-    coords -= coords[valid[0]]
+    # Zero-centre at centroid of valid residues (more balanced than first residue)
+    coords -= coords[valid].mean(axis=0)
     return coords
 
 
@@ -1567,6 +1571,22 @@ def _autocast_ctx():
     return contextlib.nullcontext()
 
 
+def _collate_batch(
+    batch: list[tuple[str, np.ndarray]], device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
+    """Pad a list of (seq_str, coords_np) into tensors for a single forward pass."""
+    seq_strs = [s[0] for s in batch]
+    L_max = max(len(s) for s in seq_strs)
+    B = len(batch)
+    seq_tokens = torch.zeros((B, L_max), dtype=torch.long, device=device)
+    targets = torch.full((B, L_max, 3), float("nan"), dtype=torch.float32, device=device)
+    for i, (seq_str, coords) in enumerate(batch):
+        toks = tokenise(seq_str)
+        seq_tokens[i, : len(toks)] = torch.tensor(toks, dtype=torch.long, device=device)
+        targets[i, : coords.shape[0]] = torch.from_numpy(coords).to(device)
+    return seq_tokens, targets, seq_strs
+
+
 def train(
     model: AlphaFold3InspiredRNA,
     train_seq_df: pd.DataFrame,
@@ -1576,9 +1596,14 @@ def train(
     extractor: RibonanzaFeatureExtractor | None = None,
     epochs: int = 50,
     lr: float = 1e-4,
+    lr_min: float = 1e-6,
+    weight_decay: float = 0.01,
+    batch_size: int = 1,
+    grad_clip: float = 1.0,
+    dist_loss_weight: float = 0.2,
+    bond_loss_weight: float = 0.1,
     max_seq_len: int = 2000,
-    accumulation_steps: int = 16,
-    log_every: int = 50,
+    log_every: int = 10,
     device: torch.device | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -1587,8 +1612,8 @@ def train(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr_min)
     scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
 
     # Coordinate normalisation constants
@@ -1614,98 +1639,111 @@ def train(
             vl["target_id"] = vl["ID"].str.rsplit("_", n=1).str[0]
         val_labels_grouped = vl.groupby("target_id")
 
+    # Pre-collect all valid (seq_str, coords) pairs once — avoids re-filtering each epoch
+    all_samples: list[tuple[str, np.ndarray]] = []
+    skipped_init = 0
+    for _, row in train_seq_df.iterrows():
+        seq_str = row["sequence"]
+        tid = row["target_id"]
+        if len(seq_str) > max_seq_len or tid not in labels_grouped.groups:
+            skipped_init += 1
+            continue
+        coords = _build_coords_array(labels_grouped.get_group(tid), len(seq_str))
+        if coords is None:
+            skipped_init += 1
+            continue
+        all_samples.append((seq_str, coords))
+    print(f"Training on {len(all_samples)} sequences ({skipped_init} skipped), batch_size={batch_size}")
+
+    import random
+
     for epoch in range(epochs):
         model.train()
-        total_loss = running_loss = count = skipped = 0
+        total_loss = 0.0
+        batch_count = skipped_batches = 0
 
-        for _, row in train_seq_df.iterrows():
-            seq_str = row["sequence"]
-            tid = row["target_id"]
+        # Shuffle and form batches each epoch
+        shuffled = all_samples.copy()
+        random.shuffle(shuffled)
+        batches = [shuffled[i : i + batch_size] for i in range(0, len(shuffled), batch_size)]
 
-            if len(seq_str) > max_seq_len or tid not in labels_grouped.groups:
-                skipped += 1
-                continue
-
-            coords = _build_coords_array(labels_grouped.get_group(tid), len(seq_str))
-            if coords is None:
-                skipped += 1
-                continue
-
-            seq_idx = torch.tensor([tokenise(seq_str)], device=device)
-            target  = torch.from_numpy(coords).unsqueeze(0).to(device=device)
-
-            ribo_1d, ribo_2d = (extractor.forward([seq_str]) if extractor else (None, None))
+        for batch in batches:
+            seq_tokens, targets, seq_strs = _collate_batch(batch, device)
+            ribo_1d, ribo_2d = (extractor.forward(seq_strs) if extractor else (None, None))
 
             try:
                 with _autocast_ctx():
-                    pred = model(seq_idx, ribo_1d_feats=ribo_1d, ribo_2d_feats=ribo_2d)
-                    if not torch.isfinite(pred).all():
-                        skipped += 1; continue
+                    preds = model(seq_tokens, ribo_1d_feats=ribo_1d, ribo_2d_feats=ribo_2d)
+                    # preds: (B, L_max, 3)
 
-                    valid_mask = ~torch.isnan(target)
+                    if not torch.isfinite(preds).all():
+                        skipped_batches += 1
+                        continue
+
+                    valid_mask = ~torch.isnan(targets)
                     if valid_mask.sum() == 0:
-                        skipped += 1; continue
+                        skipped_batches += 1
+                        continue
 
-                    target_norm = torch.clamp((target - coord_mean_t) / coord_std_t, -10, 10)
-                    loss_coord = F.smooth_l1_loss(pred[valid_mask], target_norm[valid_mask])
+                    target_norm = torch.clamp((targets - coord_mean_t) / coord_std_t, -10, 10)
+                    loss_coord = F.smooth_l1_loss(preds[valid_mask], target_norm[valid_mask])
 
-                    pred_d = pred * coord_std_t + coord_mean_t
-                    valid_rows = torch.isfinite(target.squeeze(0)).all(-1)
-                    pv = pred_d.squeeze(0)[valid_rows]
-                    tv = target.squeeze(0)[valid_rows]
-
-                    if len(pv) > 2:
-                        loss_dist = F.smooth_l1_loss(
+                    # Per-sample distance and bond loss (variable valid lengths per sample)
+                    pred_d = preds * coord_std_t + coord_mean_t
+                    loss_dist = loss_bond = torch.tensor(0.0, device=device)
+                    n_struct = 0
+                    for b in range(len(batch)):
+                        valid_rows = torch.isfinite(targets[b]).all(-1)
+                        if valid_rows.sum() <= 2:
+                            continue
+                        pv = pred_d[b][valid_rows]
+                        tv = targets[b][valid_rows]
+                        loss_dist = loss_dist + F.smooth_l1_loss(
                             torch.cdist(pv.unsqueeze(0), pv.unsqueeze(0)).squeeze(0),
                             torch.cdist(tv.unsqueeze(0), tv.unsqueeze(0)).squeeze(0),
                         )
-                        # Bond loss: only between residues that are truly adjacent in
-                        # sequence (valid_rows may have gaps, so index-1 neighbours
-                        # are not always real C1'-C1' bonds).
                         valid_idx = torch.where(valid_rows)[0]
                         is_adj = (valid_idx[1:] - valid_idx[:-1]) == 1
                         if is_adj.any():
                             pb = torch.sqrt(((pv[1:][is_adj] - pv[:-1][is_adj]) ** 2).sum(-1) + 1e-8)
                             tb = torch.sqrt(((tv[1:][is_adj] - tv[:-1][is_adj]) ** 2).sum(-1) + 1e-8)
-                            loss_bond = F.smooth_l1_loss(pb, tb)
-                        else:
-                            loss_bond = torch.tensor(0.0, device=device)
-                    else:
-                        loss_dist = loss_bond = torch.tensor(0.0, device=device)
+                            loss_bond = loss_bond + F.smooth_l1_loss(pb, tb)
+                        n_struct += 1
+                    if n_struct > 0:
+                        loss_dist = loss_dist / n_struct
+                        loss_bond = loss_bond / n_struct
 
-                    loss = loss_coord + 0.02 * loss_dist + 0.05 * loss_bond
+                    loss = loss_coord + dist_loss_weight * loss_dist + bond_loss_weight * loss_bond
 
                 if not torch.isfinite(loss):
-                    skipped += 1; continue
-
-                scaler.scale(loss / accumulation_steps).backward()
-
-                if (count + 1) % accumulation_steps == 0:
-                    scaler.unscale_(optimizer)
-                    nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                    scaler.step(optimizer)
-                    scaler.update()
                     optimizer.zero_grad()
+                    skipped_batches += 1
+                    continue
 
-                total_loss   += loss.item()
-                running_loss += loss.item()
-                count        += 1
-                del pred, target_norm, loss, valid_mask
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
 
-                if count % log_every == 0:
-                    print(f"  Epoch {epoch+1} | step {count} | loss {running_loss/log_every:.4f}")
-                    running_loss = 0
+                total_loss += loss.item()
+                batch_count += 1
+
+                if batch_count % log_every == 0:
+                    print(f"  Epoch {epoch+1} | batch {batch_count} | loss {total_loss/batch_count:.4f}")
 
                 if torch.cuda.is_available() and torch.cuda.memory_reserved() > 14.5 * 2**30:
                     torch.cuda.empty_cache()
 
             except RuntimeError as e:
-                print(f"  RuntimeError (len={len(seq_str)}): {e}")
-                skipped += 1
+                print(f"  RuntimeError (batch L_max={seq_tokens.shape[1]}): {e}")
+                optimizer.zero_grad()
+                skipped_batches += 1
 
         print(
-            f"Epoch {epoch+1}/{epochs} | avg_loss={total_loss/max(count,1):.4f} | "
-            f"trained={count} | skipped={skipped} | lr={scheduler.get_last_lr()[0]:.2e}"
+            f"Epoch {epoch+1}/{epochs} | avg_loss={total_loss/max(batch_count,1):.4f} | "
+            f"batches={batch_count} | skipped={skipped_batches} | lr={scheduler.get_last_lr()[0]:.2e}"
         )
 
         if val_labels_grouped is not None and val_seq_df is not None:
@@ -2305,11 +2343,23 @@ if __name__ == "__main__" or True:   # `or True` so Colab runs it on execute
         generate_dummy_data(DATA_DIR)
 
     # ── Config ────────────────────────────────────────────────────────────
-    PILOT_MODE    = True      # set False for full competition run
-    N_EPOCHS      = 5 if PILOT_MODE else 50
-    MAX_SEQ_LEN   = 2000
-    WEIGHTS_PATH  = "model_weights.pt"
-    RIBO_CKPT     = INPUT_PREFIX + "/models/shujun717/ribonanzanet2/PyTorch/alpha/1"
+    PILOT_MODE      = True      # set False for full competition run
+
+    # Training hyperparameters — tweak freely
+    N_EPOCHS        = 20 if PILOT_MODE else 50
+    BATCH_SIZE      = 4         # sequences per gradient step; increase for H100
+    LR              = 3e-4      # peak learning rate
+    LR_MIN          = 1e-6      # CosineAnnealingLR floor
+    WEIGHT_DECAY    = 0.01
+    GRAD_CLIP       = 1.0       # max gradient norm
+    DIST_LOSS_W     = 0.2       # pairwise distance loss weight (translation-invariant)
+    BOND_LOSS_W     = 0.1       # consecutive C1'-C1' bond length loss weight
+    MAX_SEQ_LEN     = 2000      # sequences longer than this are skipped
+    LOG_EVERY       = 10        # print loss every N batches
+
+    WEIGHTS_PATH    = "model_weights.pt"
+    LOAD_IF_EXISTS  = False     # set True to skip training and reuse saved weights
+    RIBO_CKPT       = INPUT_PREFIX + "/models/shujun717/ribonanzanet2/PyTorch/alpha/1"
 
     # ── Load data ─────────────────────────────────────────────────────────
     train_seq_df    = pd.read_csv(os.path.join(DATA_DIR, "train_sequences.csv"))
@@ -2357,7 +2407,7 @@ if __name__ == "__main__" or True:   # `or True` so Colab runs it on execute
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # ── Train (or load saved weights) ─────────────────────────────────────
-    if os.path.exists(WEIGHTS_PATH):
+    if LOAD_IF_EXISTS and os.path.exists(WEIGHTS_PATH):
         print(f"Loading weights from {WEIGHTS_PATH}")
         model.load_state_dict(torch.load(WEIGHTS_PATH, map_location=DEVICE))
         coord_cols = ["x_1", "y_1", "z_1"]
@@ -2372,7 +2422,16 @@ if __name__ == "__main__" or True:   # `or True` so Colab runs it on execute
             model, tr_seq_split, tr_lbl_split,
             val_seq_df=proxy_val_seq, val_labels_df=proxy_val_lbl,
             extractor=extractor,
-            epochs=N_EPOCHS, lr=1e-4, max_seq_len=MAX_SEQ_LEN,
+            epochs=N_EPOCHS,
+            lr=LR,
+            lr_min=LR_MIN,
+            weight_decay=WEIGHT_DECAY,
+            batch_size=BATCH_SIZE,
+            grad_clip=GRAD_CLIP,
+            dist_loss_weight=DIST_LOSS_W,
+            bond_loss_weight=BOND_LOSS_W,
+            max_seq_len=MAX_SEQ_LEN,
+            log_every=LOG_EVERY,
             device=DEVICE,
         )
         torch.save(model.state_dict(), WEIGHTS_PATH)

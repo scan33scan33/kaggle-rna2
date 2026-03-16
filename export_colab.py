@@ -139,11 +139,23 @@ if __name__ == "__main__" or True:   # `or True` so Colab runs it on execute
         generate_dummy_data(DATA_DIR)
 
     # ── Config ────────────────────────────────────────────────────────────
-    PILOT_MODE    = True      # set False for full competition run
-    N_EPOCHS      = 5 if PILOT_MODE else 50
-    MAX_SEQ_LEN   = 2000
-    WEIGHTS_PATH  = "model_weights.pt"
-    RIBO_CKPT     = INPUT_PREFIX + "/models/shujun717/ribonanzanet2/PyTorch/alpha/1"
+    PILOT_MODE      = True      # set False for full competition run
+
+    # Training hyperparameters — tweak freely
+    N_EPOCHS        = 20 if PILOT_MODE else 50
+    BATCH_SIZE      = 4         # sequences per gradient step; increase for H100
+    LR              = 3e-4      # peak learning rate
+    LR_MIN          = 1e-6      # CosineAnnealingLR floor
+    WEIGHT_DECAY    = 0.01
+    GRAD_CLIP       = 1.0       # max gradient norm
+    DIST_LOSS_W     = 0.2       # pairwise distance loss weight (translation-invariant)
+    BOND_LOSS_W     = 0.1       # consecutive C1'-C1' bond length loss weight
+    MAX_SEQ_LEN     = 2000      # sequences longer than this are skipped
+    LOG_EVERY       = 10        # print loss every N batches
+
+    WEIGHTS_PATH    = "model_weights.pt"
+    LOAD_IF_EXISTS  = False     # set True to skip training and reuse saved weights
+    RIBO_CKPT       = INPUT_PREFIX + "/models/shujun717/ribonanzanet2/PyTorch/alpha/1"
 
     # ── Load data ─────────────────────────────────────────────────────────
     train_seq_df    = pd.read_csv(os.path.join(DATA_DIR, "train_sequences.csv"))
@@ -191,7 +203,7 @@ if __name__ == "__main__" or True:   # `or True` so Colab runs it on execute
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # ── Train (or load saved weights) ─────────────────────────────────────
-    if os.path.exists(WEIGHTS_PATH):
+    if LOAD_IF_EXISTS and os.path.exists(WEIGHTS_PATH):
         print(f"Loading weights from {WEIGHTS_PATH}")
         model.load_state_dict(torch.load(WEIGHTS_PATH, map_location=DEVICE))
         coord_cols = ["x_1", "y_1", "z_1"]
@@ -206,7 +218,16 @@ if __name__ == "__main__" or True:   # `or True` so Colab runs it on execute
             model, tr_seq_split, tr_lbl_split,
             val_seq_df=proxy_val_seq, val_labels_df=proxy_val_lbl,
             extractor=extractor,
-            epochs=N_EPOCHS, lr=1e-4, max_seq_len=MAX_SEQ_LEN,
+            epochs=N_EPOCHS,
+            lr=LR,
+            lr_min=LR_MIN,
+            weight_decay=WEIGHT_DECAY,
+            batch_size=BATCH_SIZE,
+            grad_clip=GRAD_CLIP,
+            dist_loss_weight=DIST_LOSS_W,
+            bond_loss_weight=BOND_LOSS_W,
+            max_seq_len=MAX_SEQ_LEN,
+            log_every=LOG_EVERY,
             device=DEVICE,
         )
         torch.save(model.state_dict(), WEIGHTS_PATH)
