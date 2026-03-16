@@ -182,11 +182,21 @@ class RibonanzaFeatureExtractor:
     Loads RibonanzaNet2 from its Kaggle model checkpoint and extracts
     (1D, 2D) representations for RNA sequences.
     Falls back gracefully if weights are unavailable.
+
+    Uses forward hooks on the encoder layers to capture the last hidden
+    states, so we get useful features even when the model's full forward
+    fails (e.g. due to internal None pairwise features).
     """
 
     def __init__(self, checkpoint_path: str = "", auto_download: bool = True):
         self.available = False
         self.model = None
+        self._ninp = 256          # sequence feature dim (updated after load)
+        self._pairwise_dim = 64   # pairwise feature dim (updated after load)
+        self._hooked_1d: list[torch.Tensor] = []
+        self._hooked_2d: list[torch.Tensor] = []
+        self._hooks: list = []
+        self._forward_error_printed = False
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         if not checkpoint_path:
@@ -217,15 +227,45 @@ class RibonanzaFeatureExtractor:
                 return
 
             config = self._load_config(checkpoint_path, weight_files[0])
+            self._ninp = getattr(config, "ninp", 256)
+            self._pairwise_dim = getattr(config, "pairwise_dimension", 64)
+
             self.model = RibonanzaNet(config).to(self.device)
             state = torch.load(weight_files[0], map_location=self.device)
             state = state.get("state_dict", state.get("model_state_dict", state))
             self.model.load_state_dict(state, strict=False)
             self.model.eval()
+
+            # Register hooks on encoder layers to capture hidden states.
+            # This lets us get features even if the full forward() raises.
+            self._register_encoder_hooks()
+
             self.available = True
             print("RibonanzaNet2 loaded successfully.")
         except Exception as e:
             print(f"RibonanzaNet2 init failed: {e}")
+
+    def _register_encoder_hooks(self):
+        """Hook every ConvTransformerEncoderLayer to capture last 1D output."""
+        if self.model is None:
+            return
+        for name, module in self.model.named_modules():
+            cls = type(module).__name__
+            if "ConvTransformerEncoderLayer" in cls or "EncoderLayer" in cls:
+                handle = module.register_forward_hook(self._hook_fn_1d)
+                self._hooks.append(handle)
+
+    def _hook_fn_1d(self, module, inp, output):
+        """Capture the sequence (1D) output from each encoder layer."""
+        # Output can be a tensor (B,L,D) or a tuple (tensor, pairwise, ...)
+        feat = output[0] if isinstance(output, tuple) else output
+        if isinstance(feat, torch.Tensor) and feat.dim() == 3:
+            self._hooked_1d.append(feat.detach().float())
+        # If pairwise is returned as second element, capture it too
+        if isinstance(output, tuple) and len(output) >= 2:
+            pairwise = output[1]
+            if isinstance(pairwise, torch.Tensor) and pairwise.dim() == 4:
+                self._hooked_2d.append(pairwise.detach().float())
 
     def _load_config(self, checkpoint_path: str, weight_file: str):
         import yaml, json  # noqa: F811
@@ -268,24 +308,44 @@ class RibonanzaFeatureExtractor:
         for i, s in enumerate(sequences):
             for j, c in enumerate(s):
                 tokens[i, j] = mapping.get(c.upper(), 0)
+
+        self._hooked_1d.clear()
+        self._hooked_2d.clear()
+
         try:
             with torch.no_grad():
                 out = self.model(tokens)
-            # Handle tuple output: (seq_feats, pairwise_feats)
-            # pairwise_feats may be None when use_triangular_attention=False
+            # Success path: model returned normally
+            # Prefer direct tuple output (seq_feats, pairwise_feats)
             if isinstance(out, tuple) and len(out) >= 2:
                 feat_1d, feat_2d = out[0], out[1]
-                # Validate shapes before returning
                 if isinstance(feat_1d, torch.Tensor) and feat_1d.dim() == 3:
                     feat_2d_out = feat_2d if (
                         isinstance(feat_2d, torch.Tensor) and feat_2d.dim() == 4
                     ) else None
-                    return feat_1d, feat_2d_out
+                    return feat_1d.float(), feat_2d_out
             if isinstance(out, torch.Tensor) and out.dim() == 3:
-                return out, None
+                # Single tensor output — use as 1D features
+                return out.float(), None
         except Exception as e:
-            print(f"RibonanzaNet2 forward failed: {e}")
-            self.available = False
+            # Print full traceback once so the user can see what's happening
+            if not self._forward_error_printed:
+                import traceback
+                print(f"RibonanzaNet2 forward failed: {e}")
+                traceback.print_exc()
+                self._forward_error_printed = True
+
+        # Hook fallback: use the last successfully captured encoder layer output
+        if self._hooked_1d:
+            feat_1d = self._hooked_1d[-1]   # last encoder layer output
+            feat_2d = self._hooked_2d[-1] if self._hooked_2d else None
+            if not self._forward_error_printed:
+                # Only printed once, so suppress subsequent noise
+                pass
+            return feat_1d, feat_2d
+
+        # Complete failure: disable to avoid per-sample error spam
+        self.available = False
         return None, None
 
 
