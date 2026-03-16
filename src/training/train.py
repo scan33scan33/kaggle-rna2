@@ -13,6 +13,7 @@ Inference:
 
 from __future__ import annotations
 
+import math
 import os
 
 import numpy as np
@@ -259,6 +260,7 @@ class RibonanzaFeatureExtractor:
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if not self.available or self.model is None:
             return None, None
+        # RibonanzaNet2 uses 1-indexed tokens: A=1,C=2,G=3,U=4; 0=padding
         mapping = {"A": 1, "C": 2, "G": 3, "U": 4}
         B = len(sequences)
         L = max(len(s) for s in sequences)
@@ -269,10 +271,18 @@ class RibonanzaFeatureExtractor:
         try:
             with torch.no_grad():
                 out = self.model(tokens)
+            # Handle tuple output: (seq_feats, pairwise_feats)
+            # pairwise_feats may be None when use_triangular_attention=False
             if isinstance(out, tuple) and len(out) >= 2:
-                return out[0], out[1]
+                feat_1d, feat_2d = out[0], out[1]
+                # Validate shapes before returning
+                if isinstance(feat_1d, torch.Tensor) and feat_1d.dim() == 3:
+                    feat_2d_out = feat_2d if (
+                        isinstance(feat_2d, torch.Tensor) and feat_2d.dim() == 4
+                    ) else None
+                    return feat_1d, feat_2d_out
             if isinstance(out, torch.Tensor) and out.dim() == 3:
-                return out, torch.zeros(B, L, L, 32, device=self.device)
+                return out, None
         except Exception as e:
             print(f"RibonanzaNet2 forward failed: {e}")
             self.available = False
@@ -300,7 +310,10 @@ def _build_coords_array(group: pd.DataFrame, seq_len: int) -> np.ndarray | None:
 
 def _autocast_ctx():
     if torch.cuda.is_available():
-        return torch.autocast("cuda", dtype=torch.float16)
+        # bfloat16 has float32 dynamic range — prevents overflow in outer product layers
+        # float16 max is 65504, which overflows easily in pairwise (L×L×1024) ops
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        return torch.autocast("cuda", dtype=dtype)
     import contextlib
     return contextlib.nullcontext()
 
@@ -517,10 +530,12 @@ def evaluate(
 
             row_valid = torch.isfinite(target.squeeze(0)).all(-1)
             if row_valid.any():
-                pv = (pred * coord_std_t + coord_mean_t).squeeze(0)[row_valid]
+                # Clamp to training distribution before denorm to avoid float overflow
+                pred_clamped = pred.float().clamp(-15, 15)
+                pv = (pred_clamped * coord_std_t + coord_mean_t).squeeze(0)[row_valid]
                 tv = target.squeeze(0)[row_valid]
                 rmsd, tm = kabsch_rmsd_tmscore(pv, tv)
-                if rmsd != float("inf"):
+                if math.isfinite(rmsd) and rmsd < 1e5:
                     total_rmsd += rmsd
                     total_tm   += tm
                 total_pts  += row_valid.sum().item()
@@ -534,6 +549,34 @@ def evaluate(
         "count":        count,
         "skipped":      skipped,
     }
+
+
+def train_val_split(
+    seq_df: pd.DataFrame,
+    labels_df: pd.DataFrame,
+    val_fraction: float = 0.15,
+    seed: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Split seq_df/labels_df into train and val portions.
+    Returns (train_seq, train_labels, val_seq, val_labels).
+    """
+    rng = np.random.default_rng(seed)
+    ids = seq_df["target_id"].unique()
+    n_val = max(1, int(len(ids) * val_fraction))
+    val_ids = set(rng.choice(ids, size=n_val, replace=False).tolist())
+
+    train_seq    = seq_df[~seq_df["target_id"].isin(val_ids)].reset_index(drop=True)
+    val_seq      = seq_df[ seq_df["target_id"].isin(val_ids)].reset_index(drop=True)
+
+    # Propagate target_id column to labels if needed
+    lbl = labels_df.copy()
+    if "target_id" not in lbl.columns:
+        lbl["target_id"] = lbl["ID"].str.rsplit("_", n=1).str[0]
+    train_labels = lbl[~lbl["target_id"].isin(val_ids)].reset_index(drop=True)
+    val_labels   = lbl[ lbl["target_id"].isin(val_ids)].reset_index(drop=True)
+
+    return train_seq, train_labels, val_seq, val_labels
 
 
 # ---------------------------------------------------------------------------

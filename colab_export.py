@@ -1203,6 +1203,7 @@ def _extract_c1prime_from_structure(path: str, seq_len: int) -> np.ndarray:
 # TRAINING: Train / Evaluate / Inference Loop
 # ====================================================================
 
+import math
 import os
 
 import numpy as np
@@ -1446,6 +1447,7 @@ class RibonanzaFeatureExtractor:
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if not self.available or self.model is None:
             return None, None
+        # RibonanzaNet2 uses 1-indexed tokens: A=1,C=2,G=3,U=4; 0=padding
         mapping = {"A": 1, "C": 2, "G": 3, "U": 4}
         B = len(sequences)
         L = max(len(s) for s in sequences)
@@ -1456,10 +1458,18 @@ class RibonanzaFeatureExtractor:
         try:
             with torch.no_grad():
                 out = self.model(tokens)
+            # Handle tuple output: (seq_feats, pairwise_feats)
+            # pairwise_feats may be None when use_triangular_attention=False
             if isinstance(out, tuple) and len(out) >= 2:
-                return out[0], out[1]
+                feat_1d, feat_2d = out[0], out[1]
+                # Validate shapes before returning
+                if isinstance(feat_1d, torch.Tensor) and feat_1d.dim() == 3:
+                    feat_2d_out = feat_2d if (
+                        isinstance(feat_2d, torch.Tensor) and feat_2d.dim() == 4
+                    ) else None
+                    return feat_1d, feat_2d_out
             if isinstance(out, torch.Tensor) and out.dim() == 3:
-                return out, torch.zeros(B, L, L, 32, device=self.device)
+                return out, None
         except Exception as e:
             print(f"RibonanzaNet2 forward failed: {e}")
             self.available = False
@@ -1487,7 +1497,10 @@ def _build_coords_array(group: pd.DataFrame, seq_len: int) -> np.ndarray | None:
 
 def _autocast_ctx():
     if torch.cuda.is_available():
-        return torch.autocast("cuda", dtype=torch.float16)
+        # bfloat16 has float32 dynamic range — prevents overflow in outer product layers
+        # float16 max is 65504, which overflows easily in pairwise (L×L×1024) ops
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        return torch.autocast("cuda", dtype=dtype)
     import contextlib
     return contextlib.nullcontext()
 
@@ -1704,10 +1717,12 @@ def evaluate(
 
             row_valid = torch.isfinite(target.squeeze(0)).all(-1)
             if row_valid.any():
-                pv = (pred * coord_std_t + coord_mean_t).squeeze(0)[row_valid]
+                # Clamp to training distribution before denorm to avoid float overflow
+                pred_clamped = pred.float().clamp(-15, 15)
+                pv = (pred_clamped * coord_std_t + coord_mean_t).squeeze(0)[row_valid]
                 tv = target.squeeze(0)[row_valid]
                 rmsd, tm = kabsch_rmsd_tmscore(pv, tv)
-                if rmsd != float("inf"):
+                if math.isfinite(rmsd) and rmsd < 1e5:
                     total_rmsd += rmsd
                     total_tm   += tm
                 total_pts  += row_valid.sum().item()
@@ -1721,6 +1736,34 @@ def evaluate(
         "count":        count,
         "skipped":      skipped,
     }
+
+
+def train_val_split(
+    seq_df: pd.DataFrame,
+    labels_df: pd.DataFrame,
+    val_fraction: float = 0.15,
+    seed: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Split seq_df/labels_df into train and val portions.
+    Returns (train_seq, train_labels, val_seq, val_labels).
+    """
+    rng = np.random.default_rng(seed)
+    ids = seq_df["target_id"].unique()
+    n_val = max(1, int(len(ids) * val_fraction))
+    val_ids = set(rng.choice(ids, size=n_val, replace=False).tolist())
+
+    train_seq    = seq_df[~seq_df["target_id"].isin(val_ids)].reset_index(drop=True)
+    val_seq      = seq_df[ seq_df["target_id"].isin(val_ids)].reset_index(drop=True)
+
+    # Propagate target_id column to labels if needed
+    lbl = labels_df.copy()
+    if "target_id" not in lbl.columns:
+        lbl["target_id"] = lbl["ID"].str.rsplit("_", n=1).str[0]
+    train_labels = lbl[~lbl["target_id"].isin(val_ids)].reset_index(drop=True)
+    val_labels   = lbl[ lbl["target_id"].isin(val_ids)].reset_index(drop=True)
+
+    return train_seq, train_labels, val_seq, val_labels
 
 
 # ---------------------------------------------------------------------------
@@ -2232,7 +2275,18 @@ if __name__ == "__main__" or True:   # `or True` so Colab runs it on execute
         if val_seq_df is not None:
             val_seq_df = val_seq_df.head(20)
 
-    print(f"Train: {len(train_seq_df)} seqs | Val: {len(val_seq_df) if val_seq_df is not None else 0} seqs")
+    # ── Create train-subset val split if no labelled val set exists ───────
+    # This is used as a sanity check that the model can actually learn.
+    # Split 15% of training data off as a proxy validation set.
+    tr_seq_split, tr_lbl_split, proxy_val_seq, proxy_val_lbl = train_val_split(
+        train_seq_df, train_labels_df, val_fraction=0.15,
+    )
+    have_real_val = val_seq_df is not None and val_labels_df is not None
+    print(
+        f"Train: {len(train_seq_df)} seqs | "
+        f"Val: {len(val_seq_df) if have_real_val else 0} seqs (competition) | "
+        f"Proxy val: {len(proxy_val_seq)} seqs (from training split)"
+    )
 
     # ── Model + extractors ────────────────────────────────────────────────
     model     = AlphaFold3InspiredRNA().to(DEVICE)
@@ -2251,15 +2305,59 @@ if __name__ == "__main__" or True:   # `or True` so Colab runs it on execute
             1e-6, None,
         )
     else:
+        # Train with the proxy val split so we can always see learning progress
         coord_mean, coord_std = train(
-            model, train_seq_df, train_labels_df,
-            val_seq_df=val_seq_df, val_labels_df=val_labels_df,
+            model, tr_seq_split, tr_lbl_split,
+            val_seq_df=proxy_val_seq, val_labels_df=proxy_val_lbl,
             extractor=extractor,
             epochs=N_EPOCHS, lr=1e-4, max_seq_len=MAX_SEQ_LEN,
             device=DEVICE,
         )
         torch.save(model.state_dict(), WEIGHTS_PATH)
         print(f"Saved weights → {WEIGHTS_PATH}")
+
+    # ── Overfit sanity check: eval on a few TRAINING samples ─────────────
+    # If TM-score here is < 0.1 the model is not learning at all.
+    coord_mean_t = torch.tensor(coord_mean, dtype=torch.float32, device=DEVICE).view(1,1,3)
+    coord_std_t  = torch.tensor(coord_std,  dtype=torch.float32, device=DEVICE).view(1,1,3)
+    if "target_id" not in tr_lbl_split.columns:
+        tr_lbl_split["target_id"] = tr_lbl_split["ID"].str.rsplit("_", n=1).str[0]
+    train_lbl_grouped = tr_lbl_split.groupby("target_id")
+    overfit = evaluate(
+        model, tr_seq_split.head(20), train_lbl_grouped,
+        coord_mean_t, coord_std_t, extractor=extractor,
+        max_seq_len=MAX_SEQ_LEN, device=DEVICE,
+    )
+    print(
+        f"
+── Overfit check (train subset) ──────────────────────────────
+"
+        f"  TM-score={overfit['tm_score']:.4f} | RMSD={overfit['kabsch_rmsd']:.2f} Å | "
+        f"loss={overfit['avg_loss']:.4f} | n={overfit['count']}
+"
+        f"  (TM>0.1 confirms model is learning; TM~0 means it is not)
+"
+        f"──────────────────────────────────────────────────────────────"
+    )
+
+    # ── Competition val evaluation (if labels available) ─────────────────
+    if have_real_val:
+        if "target_id" not in val_labels_df.columns:
+            val_labels_df["target_id"] = val_labels_df["ID"].str.rsplit("_", n=1).str[0]
+        val_lbl_grouped = val_labels_df.groupby("target_id")
+        val_metrics = evaluate(
+            model, val_seq_df, val_lbl_grouped,
+            coord_mean_t, coord_std_t, extractor=extractor,
+            max_seq_len=MAX_SEQ_LEN, device=DEVICE,
+        )
+        print(
+            f"── Competition val ───────────────────────────────────────────
+"
+            f"  TM-score={val_metrics['tm_score']:.4f} | RMSD={val_metrics['kabsch_rmsd']:.2f} Å | "
+            f"n={val_metrics['count']}
+"
+            f"──────────────────────────────────────────────────────────────"
+        )
 
     # ── Inference + submission ─────────────────────────────────────────────
     submission_rows = run_inference(
