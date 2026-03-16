@@ -2402,8 +2402,10 @@ if __name__ == "__main__" or True:   # `or True` so Colab runs it on execute
     )
 
     # ── Model + extractors ────────────────────────────────────────────────
-    model     = AlphaFold3InspiredRNA().to(DEVICE)
     extractor = RibonanzaFeatureExtractor(checkpoint_path=RIBO_CKPT)
+    ribo_1d_dim = extractor._ninp if extractor.available else 256
+    ribo_2d_dim = extractor._pairwise_dim if extractor.available else 64
+    model     = AlphaFold3InspiredRNA(ribo_1d_dim=ribo_1d_dim, ribo_2d_dim=ribo_2d_dim).to(DEVICE)
     template_matcher = TemplateMatcher(train_seq_df, train_labels_df)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
