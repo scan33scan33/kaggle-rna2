@@ -2309,6 +2309,7 @@ if __name__ == "__main__" or True:   # `or True` so Colab runs it on execute
     N_EPOCHS      = 5 if PILOT_MODE else 50
     MAX_SEQ_LEN   = 2000
     WEIGHTS_PATH  = "model_weights.pt"
+    LOAD_IF_EXISTS = False     # set True to skip training and reuse saved weights
     RIBO_CKPT     = INPUT_PREFIX + "/models/shujun717/ribonanzanet2/PyTorch/alpha/1"
 
     # ── Load data ─────────────────────────────────────────────────────────
@@ -2357,7 +2358,7 @@ if __name__ == "__main__" or True:   # `or True` so Colab runs it on execute
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # ── Train (or load saved weights) ─────────────────────────────────────
-    if os.path.exists(WEIGHTS_PATH):
+    if LOAD_IF_EXISTS and os.path.exists(WEIGHTS_PATH):
         print(f"Loading weights from {WEIGHTS_PATH}")
         model.load_state_dict(torch.load(WEIGHTS_PATH, map_location=DEVICE))
         coord_cols = ["x_1", "y_1", "z_1"]
