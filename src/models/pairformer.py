@@ -119,6 +119,8 @@ class AlphaFold3InspiredRNA(nn.Module):
         num_blocks: int = 8,
         max_len: int = 4096,
         dropout: float = 0.1,
+        ribo_1d_dim: int = 256,   # RibonanzaNet2 encoder hidden dim (ninp)
+        ribo_2d_dim: int = 64,    # RibonanzaNet2 pairwise dim
     ):
         super().__init__()
         self.d_single = d_single
@@ -128,9 +130,9 @@ class AlphaFold3InspiredRNA(nn.Module):
         self.abs_pos_emb = nn.Embedding(max_len, d_single)
         self.rel_pos_emb = nn.Embedding(65, d_pair)       # [-32, +32] clipped
 
-        # RibonanzaNet2 integration projections
-        self.ribo_proj_1d = nn.Linear(64, d_single)
-        self.ribo_proj_2d = nn.Linear(32, d_pair)
+        # RibonanzaNet2 integration projections — dims match actual checkpoint output
+        self.ribo_proj_1d = nn.Linear(ribo_1d_dim, d_single)
+        self.ribo_proj_2d = nn.Linear(ribo_2d_dim, d_pair)
 
         self.blocks = nn.ModuleList([
             PairformerBlock(d_single, d_pair, nhead, dropout)
@@ -151,8 +153,8 @@ class AlphaFold3InspiredRNA(nn.Module):
     def forward(
         self,
         seq_idx: torch.Tensor,                          # (B, L) int tokens
-        ribo_1d_feats: torch.Tensor | None = None,      # (B, L, 64)
-        ribo_2d_feats: torch.Tensor | None = None,      # (B, L, L, 32)
+        ribo_1d_feats: torch.Tensor | None = None,      # (B, L, ribo_1d_dim)
+        ribo_2d_feats: torch.Tensor | None = None,      # (B, L, L, ribo_2d_dim)
     ) -> torch.Tensor:                                  # (B, L, 3) C1' coords
         B, L = seq_idx.shape
 
