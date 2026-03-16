@@ -1501,9 +1501,14 @@ class RibonanzaFeatureExtractor:
         self._hooked_1d.clear()
         self._hooked_2d.clear()
 
+        # src_mask: (B, L) float, 1.0 = valid position, 0.0 = padding.
+        # TriangleMultiplicativeModule always calls src_mask.unsqueeze(-1),
+        # so passing None causes AttributeError. Use all-ones (no padding).
+        src_mask = (tokens > 0).float()
+
         try:
             with torch.no_grad():
-                out = self.model(tokens)
+                out = self.model(tokens, src_mask=src_mask)
             # Success path: model returned normally
             # Prefer direct tuple output (seq_feats, pairwise_feats)
             if isinstance(out, tuple) and len(out) >= 2:
