@@ -119,8 +119,8 @@ class AlphaFold3InspiredRNA(nn.Module):
         num_blocks: int = 8,
         max_len: int = 4096,
         dropout: float = 0.1,
-        ribo_1d_dim: int = 256,
-        ribo_2d_dim: int = 64,
+        ribo_1d_dim: int = 384,
+        ribo_2d_dim: int = 128,
     ):
         super().__init__()
         self.d_single = d_single
