@@ -326,12 +326,15 @@ class RibonanzaFeatureExtractor:
             # Prefer direct tuple output (seq_feats, pairwise_feats)
             if isinstance(out, tuple) and len(out) >= 2:
                 feat_1d, feat_2d = out[0], out[1]
-                if isinstance(feat_1d, torch.Tensor) and feat_1d.dim() == 3:
+                if (isinstance(feat_1d, torch.Tensor) and feat_1d.dim() == 3
+                        and feat_1d.shape[-1] == self._ninp):
                     feat_2d_out = feat_2d if (
                         isinstance(feat_2d, torch.Tensor) and feat_2d.dim() == 4
+                        and feat_2d.shape[-1] == self._pairwise_dim
                     ) else None
                     return feat_1d.float(), feat_2d_out
-            if isinstance(out, torch.Tensor) and out.dim() == 3:
+            if (isinstance(out, torch.Tensor) and out.dim() == 3
+                    and out.shape[-1] == self._ninp):
                 # Single tensor output — use as 1D features
                 return out.float(), None
         except Exception as e:
