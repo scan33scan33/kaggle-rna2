@@ -116,21 +116,27 @@ class PairformerBlock(nn.Module):
         # pair bias: (B, L, L, nhead) → (B, nhead, L, L)
         attn_bias = self.pair_bias_proj(z).permute(0, 3, 1, 2)
 
+        out = None
         if _xformers_available:
-            # memory_efficient_attention supports arbitrary float bias + fused kernel
-            out = _xformers_mea(q, k, v, attn_bias=attn_bias)  # (B, L, nhead, head_dim)
-            out = out.reshape(B, L, -1)
-        elif hasattr(F, "scaled_dot_product_attention"):
-            # SDPA falls back to math backend with a float mask (no Flash Attn), but still correct
-            q_t, k_t, v_t = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            out = F.scaled_dot_product_attention(q_t, k_t, v_t, attn_mask=attn_bias, dropout_p=0.0)
-            out = out.transpose(1, 2).reshape(B, L, -1)
-        else:
-            q_t, k_t, v_t = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            attn_weights = torch.matmul(q_t, k_t.transpose(-2, -1)) / math.sqrt(q.size(-1))
-            attn_weights = attn_weights + attn_bias
-            out = torch.matmul(torch.softmax(attn_weights, dim=-1), v_t)
-            out = out.transpose(1, 2).reshape(B, L, -1)
+            try:
+                # contiguous bias required by xFormers kernels
+                out = _xformers_mea(q, k, v, attn_bias=attn_bias.contiguous())
+                out = out.reshape(B, L, -1)
+            except (NotImplementedError, RuntimeError):
+                out = None  # GPU too new / head_dim too small — fall through
+
+        if out is None:
+            if hasattr(F, "scaled_dot_product_attention"):
+                q_t, k_t, v_t = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+                out = F.scaled_dot_product_attention(q_t, k_t, v_t, attn_mask=attn_bias, dropout_p=0.0)
+                out = out.transpose(1, 2).reshape(B, L, -1)
+            else:
+                q_t, k_t, v_t = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+                attn_weights = torch.matmul(q_t, k_t.transpose(-2, -1)) / math.sqrt(q.size(-1))
+                attn_weights = attn_weights + attn_bias
+                out = torch.matmul(torch.softmax(attn_weights, dim=-1), v_t)
+                out = out.transpose(1, 2).reshape(B, L, -1)
+
         x = res_x + self.drop1(self.out_proj(out))
 
         # 2. Feed-forward transition
@@ -1535,12 +1541,15 @@ class RibonanzaFeatureExtractor:
             # Prefer direct tuple output (seq_feats, pairwise_feats)
             if isinstance(out, tuple) and len(out) >= 2:
                 feat_1d, feat_2d = out[0], out[1]
-                if isinstance(feat_1d, torch.Tensor) and feat_1d.dim() == 3:
+                if (isinstance(feat_1d, torch.Tensor) and feat_1d.dim() == 3
+                        and feat_1d.shape[-1] == self._ninp):
                     feat_2d_out = feat_2d if (
                         isinstance(feat_2d, torch.Tensor) and feat_2d.dim() == 4
+                        and feat_2d.shape[-1] == self._pairwise_dim
                     ) else None
                     return feat_1d.float(), feat_2d_out
-            if isinstance(out, torch.Tensor) and out.dim() == 3:
+            if (isinstance(out, torch.Tensor) and out.dim() == 3
+                    and out.shape[-1] == self._ninp):
                 # Single tensor output — use as 1D features
                 return out.float(), None
         except Exception as e:
@@ -1640,14 +1649,11 @@ def train(
     scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
 
     # Coordinate normalisation constants
-    coord_cols = ["x_1", "y_1", "z_1"]
+    # coord_std MUST be computed from already-centred coordinates, not raw absolute
+    # positions — raw labels span hundreds of Å globally, which would make target_norm ≈ 0
+    # and kill the coord-loss signal entirely.  We compute it below after all_samples is built.
     coord_mean = np.zeros(3, dtype=np.float32)
-    coord_std = np.clip(
-        train_labels_df[coord_cols].std(skipna=True).values.astype(np.float32),
-        1e-6, None,
-    )
     coord_mean_t = torch.tensor(coord_mean, dtype=torch.float32, device=device).view(1, 1, 3)
-    coord_std_t  = torch.tensor(coord_std,  dtype=torch.float32, device=device).view(1, 1, 3)
 
     # Pre-group labels
     labels = train_labels_df.copy()
@@ -1676,6 +1682,18 @@ def train(
             skipped_init += 1
             continue
         all_samples.append((seq_str, coords))
+
+    # Compute coord_std from centred training coords (each structure already centred by
+    # _build_coords_array).  Using raw label coordinates would give a hugely inflated std
+    # (absolute crystal positions span hundreds of Å) making target_norm ≈ 0.
+    if all_samples:
+        stacked = np.concatenate([c[np.isfinite(c[:, 0])] for _, c in all_samples], axis=0)
+        coord_std = np.clip(stacked.std(axis=0).astype(np.float32), 1.0, None)
+    else:
+        coord_std = np.full(3, 30.0, dtype=np.float32)
+    coord_std_t = torch.tensor(coord_std, dtype=torch.float32, device=device).view(1, 1, 3)
+    print(f"coord_std (centred): {coord_std}")
+
     print(f"Training on {len(all_samples)} sequences ({skipped_init} skipped), batch_size={batch_size}")
 
     import random
@@ -1712,6 +1730,8 @@ def train(
                     loss_coord = F.smooth_l1_loss(preds[valid_mask], target_norm[valid_mask])
 
                     # Per-sample distance and bond loss (variable valid lengths per sample)
+                    # Skip O(L²) cdist for long sequences to avoid GPU OOM.
+                    _MAX_DIST_LEN = 400
                     pred_d = preds * coord_std_t + coord_mean_t
                     loss_dist = loss_bond = torch.tensor(0.0, device=device)
                     n_struct = 0
@@ -1721,10 +1741,11 @@ def train(
                             continue
                         pv = pred_d[b][valid_rows]
                         tv = targets[b][valid_rows]
-                        loss_dist = loss_dist + F.smooth_l1_loss(
-                            torch.cdist(pv.unsqueeze(0), pv.unsqueeze(0)).squeeze(0),
-                            torch.cdist(tv.unsqueeze(0), tv.unsqueeze(0)).squeeze(0),
-                        )
+                        if pv.shape[0] <= _MAX_DIST_LEN:
+                            loss_dist = loss_dist + F.smooth_l1_loss(
+                                torch.cdist(pv.unsqueeze(0), pv.unsqueeze(0)).squeeze(0),
+                                torch.cdist(tv.unsqueeze(0), tv.unsqueeze(0)).squeeze(0),
+                            )
                         valid_idx = torch.where(valid_rows)[0]
                         is_adj = (valid_idx[1:] - valid_idx[:-1]) == 1
                         if is_adj.any():
@@ -2473,14 +2494,10 @@ if __name__ == "__main__" or True:   # `or True` so Colab runs it on execute
         max_seq_len=MAX_SEQ_LEN, device=DEVICE,
     )
     print(
-        f"
-── Overfit check (train subset) ──────────────────────────────
-"
+        f"\n── Overfit check (train subset) ──────────────────────────────\n"
         f"  TM-score={overfit['tm_score']:.4f} | RMSD={overfit['kabsch_rmsd']:.2f} Å | "
-        f"loss={overfit['avg_loss']:.4f} | n={overfit['count']}
-"
-        f"  (TM>0.1 confirms model is learning; TM~0 means it is not)
-"
+        f"loss={overfit['avg_loss']:.4f} | n={overfit['count']}\n"
+        f"  (TM>0.1 confirms model is learning; TM~0 means it is not)\n"
         f"──────────────────────────────────────────────────────────────"
     )
 
@@ -2495,11 +2512,9 @@ if __name__ == "__main__" or True:   # `or True` so Colab runs it on execute
             max_seq_len=MAX_SEQ_LEN, device=DEVICE,
         )
         print(
-            f"── Competition val ───────────────────────────────────────────
-"
+            f"── Competition val ───────────────────────────────────────────\n"
             f"  TM-score={val_metrics['tm_score']:.4f} | RMSD={val_metrics['kabsch_rmsd']:.2f} Å | "
-            f"n={val_metrics['count']}
-"
+            f"n={val_metrics['count']}\n"
             f"──────────────────────────────────────────────────────────────"
         )
 

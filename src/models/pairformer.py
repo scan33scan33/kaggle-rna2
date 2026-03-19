@@ -80,21 +80,27 @@ class PairformerBlock(nn.Module):
         # pair bias: (B, L, L, nhead) → (B, nhead, L, L)
         attn_bias = self.pair_bias_proj(z).permute(0, 3, 1, 2)
 
+        out = None
         if _xformers_available:
-            # memory_efficient_attention supports arbitrary float bias + fused kernel
-            out = _xformers_mea(q, k, v, attn_bias=attn_bias)  # (B, L, nhead, head_dim)
-            out = out.reshape(B, L, -1)
-        elif hasattr(F, "scaled_dot_product_attention"):
-            # SDPA falls back to math backend with a float mask (no Flash Attn), but still correct
-            q_t, k_t, v_t = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            out = F.scaled_dot_product_attention(q_t, k_t, v_t, attn_mask=attn_bias, dropout_p=0.0)
-            out = out.transpose(1, 2).reshape(B, L, -1)
-        else:
-            q_t, k_t, v_t = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            attn_weights = torch.matmul(q_t, k_t.transpose(-2, -1)) / math.sqrt(q.size(-1))
-            attn_weights = attn_weights + attn_bias
-            out = torch.matmul(torch.softmax(attn_weights, dim=-1), v_t)
-            out = out.transpose(1, 2).reshape(B, L, -1)
+            try:
+                # contiguous bias required by xFormers kernels
+                out = _xformers_mea(q, k, v, attn_bias=attn_bias.contiguous())
+                out = out.reshape(B, L, -1)
+            except (NotImplementedError, RuntimeError):
+                out = None  # GPU too new / head_dim too small — fall through
+
+        if out is None:
+            if hasattr(F, "scaled_dot_product_attention"):
+                q_t, k_t, v_t = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+                out = F.scaled_dot_product_attention(q_t, k_t, v_t, attn_mask=attn_bias, dropout_p=0.0)
+                out = out.transpose(1, 2).reshape(B, L, -1)
+            else:
+                q_t, k_t, v_t = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+                attn_weights = torch.matmul(q_t, k_t.transpose(-2, -1)) / math.sqrt(q.size(-1))
+                attn_weights = attn_weights + attn_bias
+                out = torch.matmul(torch.softmax(attn_weights, dim=-1), v_t)
+                out = out.transpose(1, 2).reshape(B, L, -1)
+
         x = res_x + self.drop1(self.out_proj(out))
 
         # 2. Feed-forward transition
