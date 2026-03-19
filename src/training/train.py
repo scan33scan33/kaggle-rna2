@@ -515,8 +515,6 @@ def train(
                     loss_coord = F.smooth_l1_loss(preds[valid_mask], target_norm[valid_mask])
 
                     # Per-sample distance and bond loss (variable valid lengths per sample)
-                    # Skip O(L²) cdist for long sequences to avoid GPU OOM.
-                    _MAX_DIST_LEN = 400
                     pred_d = preds * coord_std_t + coord_mean_t
                     loss_dist = loss_bond = torch.tensor(0.0, device=device)
                     n_struct = 0
@@ -526,11 +524,22 @@ def train(
                             continue
                         pv = pred_d[b][valid_rows]
                         tv = targets[b][valid_rows]
-                        if pv.shape[0] <= _MAX_DIST_LEN:
-                            loss_dist = loss_dist + F.smooth_l1_loss(
-                                torch.cdist(pv.unsqueeze(0), pv.unsqueeze(0)).squeeze(0),
-                                torch.cdist(tv.unsqueeze(0), tv.unsqueeze(0)).squeeze(0),
-                            )
+                        # Local-window dist loss: compare distances within a sliding window
+                        # of ±_DIST_WIN residues.  O(L * window) instead of O(L²) — runs
+                        # on all sequence lengths without OOM.
+                        _DIST_WIN = 32
+                        L_v = pv.shape[0]
+                        p_rows, p_cols = [], []
+                        for start in range(0, L_v, _DIST_WIN):
+                            end = min(start + _DIST_WIN, L_v)
+                            chunk_p = pv[start:end]
+                            chunk_t = tv[start:end]
+                            p_rows.append(torch.cdist(chunk_p.unsqueeze(0), chunk_p.unsqueeze(0)).squeeze(0))
+                            p_cols.append(torch.cdist(chunk_t.unsqueeze(0), chunk_t.unsqueeze(0)).squeeze(0))
+                        loss_dist = loss_dist + F.smooth_l1_loss(
+                            torch.cat([r.flatten() for r in p_rows]),
+                            torch.cat([r.flatten() for r in p_cols]),
+                        )
                         valid_idx = torch.where(valid_rows)[0]
                         is_adj = (valid_idx[1:] - valid_idx[:-1]) == 1
                         if is_adj.any():
