@@ -253,10 +253,10 @@ if __name__ == "__main__" or True:   # `or True` so Colab runs it on execute
         max_seq_len=MAX_SEQ_LEN, device=DEVICE,
     )
     print(
-        f"\n── Overfit check (train subset) ──────────────────────────────\n"
+        f"\\n── Overfit check (train subset) ──────────────────────────────\\n"
         f"  TM-score={overfit['tm_score']:.4f} | RMSD={overfit['kabsch_rmsd']:.2f} Å | "
-        f"loss={overfit['avg_loss']:.4f} | n={overfit['count']}\n"
-        f"  (TM>0.1 confirms model is learning; TM~0 means it is not)\n"
+        f"loss={overfit['avg_loss']:.4f} | n={overfit['count']}\\n"
+        f"  (TM>0.1 confirms model is learning; TM~0 means it is not)\\n"
         f"──────────────────────────────────────────────────────────────"
     )
 
@@ -271,9 +271,9 @@ if __name__ == "__main__" or True:   # `or True` so Colab runs it on execute
             max_seq_len=MAX_SEQ_LEN, device=DEVICE,
         )
         print(
-            f"── Competition val ───────────────────────────────────────────\n"
+            f"── Competition val ───────────────────────────────────────────\\n"
             f"  TM-score={val_metrics['tm_score']:.4f} | RMSD={val_metrics['kabsch_rmsd']:.2f} Å | "
-            f"n={val_metrics['count']}\n"
+            f"n={val_metrics['count']}\\n"
             f"──────────────────────────────────────────────────────────────"
         )
 
