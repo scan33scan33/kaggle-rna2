@@ -1468,12 +1468,14 @@ class RibonanzaFeatureExtractor:
         """Capture the sequence (1D) output from each encoder layer."""
         # Output can be a tensor (B,L,D) or a tuple (tensor, pairwise, ...)
         feat = output[0] if isinstance(output, tuple) else output
-        if isinstance(feat, torch.Tensor) and feat.dim() == 3:
+        if (isinstance(feat, torch.Tensor) and feat.dim() == 3
+                and feat.shape[-1] == self._ninp):
             self._hooked_1d.append(feat.detach().float())
         # If pairwise is returned as second element, capture it too
         if isinstance(output, tuple) and len(output) >= 2:
             pairwise = output[1]
-            if isinstance(pairwise, torch.Tensor) and pairwise.dim() == 4:
+            if (isinstance(pairwise, torch.Tensor) and pairwise.dim() == 4
+                    and pairwise.shape[-1] == self._pairwise_dim):
                 self._hooked_2d.append(pairwise.detach().float())
 
     def _load_config(self, checkpoint_path: str, weight_file: str):
