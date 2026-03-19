@@ -23,6 +23,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from xformers.ops import memory_efficient_attention as _xformers_mea
+    _xformers_available = True
+except ImportError:
+    _xformers_available = False
+
 
 class PairformerBlock(nn.Module):
     def __init__(self, d_single: int = 128, d_pair: int = 64, nhead: int = 8, dropout: float = 0.1):
@@ -66,22 +72,29 @@ class PairformerBlock(nn.Module):
         res_x = x
         x_norm = self.norm1(x)
 
-        q = self.q_proj(x_norm).view(B, L, self.nhead, -1).transpose(1, 2)
-        k = self.k_proj(x_norm).view(B, L, self.nhead, -1).transpose(1, 2)
-        v = self.v_proj(x_norm).view(B, L, self.nhead, -1).transpose(1, 2)
+        # q/k/v: (B, L, nhead, head_dim) — xFormers-native layout
+        q = self.q_proj(x_norm).view(B, L, self.nhead, -1)
+        k = self.k_proj(x_norm).view(B, L, self.nhead, -1)
+        v = self.v_proj(x_norm).view(B, L, self.nhead, -1)
 
         # pair bias: (B, L, L, nhead) → (B, nhead, L, L)
-        attn_mask = self.pair_bias_proj(z).permute(0, 3, 1, 2)
+        attn_bias = self.pair_bias_proj(z).permute(0, 3, 1, 2)
 
-        if hasattr(F, "scaled_dot_product_attention"):
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0)
+        if _xformers_available:
+            # memory_efficient_attention supports arbitrary float bias + fused kernel
+            out = _xformers_mea(q, k, v, attn_bias=attn_bias)  # (B, L, nhead, head_dim)
+            out = out.reshape(B, L, -1)
+        elif hasattr(F, "scaled_dot_product_attention"):
+            # SDPA falls back to math backend with a float mask (no Flash Attn), but still correct
+            q_t, k_t, v_t = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            out = F.scaled_dot_product_attention(q_t, k_t, v_t, attn_mask=attn_bias, dropout_p=0.0)
+            out = out.transpose(1, 2).reshape(B, L, -1)
         else:
-            attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
-            attn_weights = attn_weights + attn_mask
-            attn_probs = torch.softmax(attn_weights, dim=-1)
-            out = torch.matmul(attn_probs, v)
-
-        out = out.transpose(1, 2).reshape(B, L, -1)
+            q_t, k_t, v_t = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            attn_weights = torch.matmul(q_t, k_t.transpose(-2, -1)) / math.sqrt(q.size(-1))
+            attn_weights = attn_weights + attn_bias
+            out = torch.matmul(torch.softmax(attn_weights, dim=-1), v_t)
+            out = out.transpose(1, 2).reshape(B, L, -1)
         x = res_x + self.drop1(self.out_proj(out))
 
         # 2. Feed-forward transition
@@ -119,8 +132,8 @@ class AlphaFold3InspiredRNA(nn.Module):
         num_blocks: int = 8,
         max_len: int = 4096,
         dropout: float = 0.1,
-        ribo_1d_dim: int = 256,
-        ribo_2d_dim: int = 64,
+        ribo_1d_dim: int = 384,
+        ribo_2d_dim: int = 128,
     ):
         super().__init__()
         self.d_single = d_single

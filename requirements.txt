@@ -7,6 +7,7 @@ biopython>=1.81          # CIF/PDB parsing (C1' extraction)
 # Deep learning
 torch>=2.1
 einops>=0.7
+xformers>=0.0.23  # memory_efficient_attention with float bias support
 
 # Boltz-1/2 (MIT license — AlphaFold3-level, supports RNA)
 # Install: pip install boltz
