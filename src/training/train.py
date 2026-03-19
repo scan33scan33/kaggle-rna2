@@ -434,14 +434,11 @@ def train(
     scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
 
     # Coordinate normalisation constants
-    coord_cols = ["x_1", "y_1", "z_1"]
+    # coord_std MUST be computed from already-centred coordinates, not raw absolute
+    # positions — raw labels span hundreds of Å globally, which would make target_norm ≈ 0
+    # and kill the coord-loss signal entirely.  We compute it below after all_samples is built.
     coord_mean = np.zeros(3, dtype=np.float32)
-    coord_std = np.clip(
-        train_labels_df[coord_cols].std(skipna=True).values.astype(np.float32),
-        1e-6, None,
-    )
     coord_mean_t = torch.tensor(coord_mean, dtype=torch.float32, device=device).view(1, 1, 3)
-    coord_std_t  = torch.tensor(coord_std,  dtype=torch.float32, device=device).view(1, 1, 3)
 
     # Pre-group labels
     labels = train_labels_df.copy()
@@ -470,6 +467,18 @@ def train(
             skipped_init += 1
             continue
         all_samples.append((seq_str, coords))
+
+    # Compute coord_std from centred training coords (each structure already centred by
+    # _build_coords_array).  Using raw label coordinates would give a hugely inflated std
+    # (absolute crystal positions span hundreds of Å) making target_norm ≈ 0.
+    if all_samples:
+        stacked = np.concatenate([c[np.isfinite(c[:, 0])] for _, c in all_samples], axis=0)
+        coord_std = np.clip(stacked.std(axis=0).astype(np.float32), 1.0, None)
+    else:
+        coord_std = np.full(3, 30.0, dtype=np.float32)
+    coord_std_t = torch.tensor(coord_std, dtype=torch.float32, device=device).view(1, 1, 3)
+    print(f"coord_std (centred): {coord_std}")
+
     print(f"Training on {len(all_samples)} sequences ({skipped_init} skipped), batch_size={batch_size}")
 
     import random
@@ -506,6 +515,8 @@ def train(
                     loss_coord = F.smooth_l1_loss(preds[valid_mask], target_norm[valid_mask])
 
                     # Per-sample distance and bond loss (variable valid lengths per sample)
+                    # Skip O(L²) cdist for long sequences to avoid GPU OOM.
+                    _MAX_DIST_LEN = 400
                     pred_d = preds * coord_std_t + coord_mean_t
                     loss_dist = loss_bond = torch.tensor(0.0, device=device)
                     n_struct = 0
@@ -515,10 +526,11 @@ def train(
                             continue
                         pv = pred_d[b][valid_rows]
                         tv = targets[b][valid_rows]
-                        loss_dist = loss_dist + F.smooth_l1_loss(
-                            torch.cdist(pv.unsqueeze(0), pv.unsqueeze(0)).squeeze(0),
-                            torch.cdist(tv.unsqueeze(0), tv.unsqueeze(0)).squeeze(0),
-                        )
+                        if pv.shape[0] <= _MAX_DIST_LEN:
+                            loss_dist = loss_dist + F.smooth_l1_loss(
+                                torch.cdist(pv.unsqueeze(0), pv.unsqueeze(0)).squeeze(0),
+                                torch.cdist(tv.unsqueeze(0), tv.unsqueeze(0)).squeeze(0),
+                            )
                         valid_idx = torch.where(valid_rows)[0]
                         is_adj = (valid_idx[1:] - valid_idx[:-1]) == 1
                         if is_adj.any():
