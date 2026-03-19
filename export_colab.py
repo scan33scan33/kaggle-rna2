@@ -375,7 +375,10 @@ def build_notebook(flat_source: str) -> dict:
             "source": src.splitlines(keepends=True),
         }
 
-    # First chunk = setup header (before any banner)
+    # First cell: pip installs (Colab-idiomatic !pip syntax)
+    cells.append(make_cell("!pip install xformers -q\n"))
+
+    # Second chunk = setup header (before any banner)
     if sections:
         cells.append(make_cell(sections[0]))
 
