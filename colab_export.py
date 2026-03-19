@@ -18,6 +18,13 @@ if False:
 
 INPUT_PREFIX = '/content/drive/MyDrive/kaggle_data'
 
+# ── Install xformers for memory-efficient attention ────────────────────────
+import subprocess, sys
+subprocess.run(
+    [sys.executable, "-m", "pip", "install", "xformers", "-q"],
+    check=False,
+)
+
 # ── GPU check ──────────────────────────────────────────────────────────────
 import os, subprocess
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -51,6 +58,12 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+try:
+    from xformers.ops import memory_efficient_attention as _xformers_mea
+    _xformers_available = True
+except ImportError:
+    _xformers_available = False
 
 
 class PairformerBlock(nn.Module):
@@ -95,22 +108,29 @@ class PairformerBlock(nn.Module):
         res_x = x
         x_norm = self.norm1(x)
 
-        q = self.q_proj(x_norm).view(B, L, self.nhead, -1).transpose(1, 2)
-        k = self.k_proj(x_norm).view(B, L, self.nhead, -1).transpose(1, 2)
-        v = self.v_proj(x_norm).view(B, L, self.nhead, -1).transpose(1, 2)
+        # q/k/v: (B, L, nhead, head_dim) — xFormers-native layout
+        q = self.q_proj(x_norm).view(B, L, self.nhead, -1)
+        k = self.k_proj(x_norm).view(B, L, self.nhead, -1)
+        v = self.v_proj(x_norm).view(B, L, self.nhead, -1)
 
         # pair bias: (B, L, L, nhead) → (B, nhead, L, L)
-        attn_mask = self.pair_bias_proj(z).permute(0, 3, 1, 2)
+        attn_bias = self.pair_bias_proj(z).permute(0, 3, 1, 2)
 
-        if hasattr(F, "scaled_dot_product_attention"):
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0)
+        if _xformers_available:
+            # memory_efficient_attention supports arbitrary float bias + fused kernel
+            out = _xformers_mea(q, k, v, attn_bias=attn_bias)  # (B, L, nhead, head_dim)
+            out = out.reshape(B, L, -1)
+        elif hasattr(F, "scaled_dot_product_attention"):
+            # SDPA falls back to math backend with a float mask (no Flash Attn), but still correct
+            q_t, k_t, v_t = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            out = F.scaled_dot_product_attention(q_t, k_t, v_t, attn_mask=attn_bias, dropout_p=0.0)
+            out = out.transpose(1, 2).reshape(B, L, -1)
         else:
-            attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
-            attn_weights = attn_weights + attn_mask
-            attn_probs = torch.softmax(attn_weights, dim=-1)
-            out = torch.matmul(attn_probs, v)
-
-        out = out.transpose(1, 2).reshape(B, L, -1)
+            q_t, k_t, v_t = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            attn_weights = torch.matmul(q_t, k_t.transpose(-2, -1)) / math.sqrt(q.size(-1))
+            attn_weights = attn_weights + attn_bias
+            out = torch.matmul(torch.softmax(attn_weights, dim=-1), v_t)
+            out = out.transpose(1, 2).reshape(B, L, -1)
         x = res_x + self.drop1(self.out_proj(out))
 
         # 2. Feed-forward transition
@@ -1514,20 +1534,13 @@ class RibonanzaFeatureExtractor:
             if isinstance(out, tuple) and len(out) >= 2:
                 feat_1d, feat_2d = out[0], out[1]
                 if isinstance(feat_1d, torch.Tensor) and feat_1d.dim() == 3:
-                    if feat_1d.shape[-1] != self._ninp:
-                        # Wrong feature dim (e.g. logit output rather than hidden state);
-                        # fall through to hook fallback below
-                        feat_1d = None
-                    else:
-                        feat_2d_out = feat_2d if (
-                            isinstance(feat_2d, torch.Tensor) and feat_2d.dim() == 4
-                            and feat_2d.shape[-1] == self._pairwise_dim
-                        ) else None
-                        return feat_1d.float(), feat_2d_out
+                    feat_2d_out = feat_2d if (
+                        isinstance(feat_2d, torch.Tensor) and feat_2d.dim() == 4
+                    ) else None
+                    return feat_1d.float(), feat_2d_out
             if isinstance(out, torch.Tensor) and out.dim() == 3:
-                if out.shape[-1] == self._ninp:
-                    return out.float(), None
-                # Wrong dim — fall through to hook fallback
+                # Single tensor output — use as 1D features
+                return out.float(), None
         except Exception as e:
             # Print full traceback once so the user can see what's happening
             if not self._forward_error_printed:
@@ -1537,15 +1550,13 @@ class RibonanzaFeatureExtractor:
                 self._forward_error_printed = True
 
         # Hook fallback: use the last successfully captured encoder layer output
-        # whose hidden dim matches _ninp
-        for feat_1d in reversed(self._hooked_1d):
-            if feat_1d.shape[-1] == self._ninp:
-                feat_2d = None
-                for f2 in reversed(self._hooked_2d):
-                    if f2.shape[-1] == self._pairwise_dim:
-                        feat_2d = f2
-                        break
-                return feat_1d, feat_2d
+        if self._hooked_1d:
+            feat_1d = self._hooked_1d[-1]   # last encoder layer output
+            feat_2d = self._hooked_2d[-1] if self._hooked_2d else None
+            if not self._forward_error_printed:
+                # Only printed once, so suppress subsequent noise
+                pass
+            return feat_1d, feat_2d
 
         # Complete failure: disable to avoid per-sample error spam
         self.available = False

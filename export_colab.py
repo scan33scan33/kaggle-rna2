@@ -77,6 +77,13 @@ if False:
 
 INPUT_PREFIX = '/content/drive/MyDrive/kaggle_data'
 
+# ── Install xformers for memory-efficient attention ────────────────────────
+import subprocess, sys
+subprocess.run(
+    [sys.executable, "-m", "pip", "install", "xformers", "-q"],
+    check=False,
+)
+
 # ── GPU check ──────────────────────────────────────────────────────────────
 import os, subprocess
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
